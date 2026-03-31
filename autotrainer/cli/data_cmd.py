@@ -31,7 +31,8 @@ def data_command(
     from autotrainer.managers.data_pipeline import DataPipeline
 
     cfg = AutoTrainerConfig.from_env()
-    work_dir = output_dir or os.path.join(cfg.work_dir, "data")
+    # Default: save to ./autotrainer_output/ in current working directory
+    work_dir = output_dir or os.path.join(os.getcwd(), "autotrainer_output")
 
     # Validate paths, make absolute, and expand "collection directories"
     valid_paths = []

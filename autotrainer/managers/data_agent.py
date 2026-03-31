@@ -108,16 +108,44 @@ class DataAgent:
     # ══════════════════════════════════════════════════════════
 
     def run(self, data_paths: list[str]) -> list[DatasetResult]:
-        """Process a list of dataset paths."""
+        """Process a list of dataset paths, with resume support."""
+        total = len(data_paths)
         results = []
-        for path in data_paths:
+
+        # Load existing index for resume
+        index = safe_read_json(os.path.join(self.work_dir, "data_index.json")) or {"datasets": []}
+        completed_paths = {
+            d["source_path"] for d in index.get("datasets", [])
+            if d.get("status") == "completed"
+        }
+
+        for i, path in enumerate(data_paths, 1):
+            name = os.path.basename(path)
             click.echo(f"\n{'═' * 65}")
-            click.echo(f"  Dataset: {os.path.basename(path)}")
-            click.echo(f"  Path:    {path}")
+            click.echo(f"  [{i}/{total}] {name}")
+            click.echo(f"  Path: {path}")
+
+            # Resume: skip already completed
+            if path in completed_paths:
+                click.echo(f"  [SKIP] Already completed in previous run")
+                # Load previous result for summary
+                for d in index.get("datasets", []):
+                    if d["source_path"] == path:
+                        r = DatasetResult(**{k: v for k, v in d.items() if k in DatasetResult.__dataclass_fields__})
+                        results.append(r)
+                        break
+                continue
+
             click.echo(f"{'═' * 65}")
             result = self._process_one(path)
             results.append(result)
             self._save_result(result)
+
+            # Inline status after each dataset
+            status_icon = "✓" if result.status == "completed" else "✗"
+            n = result.profile.get("num_samples", 0)
+            click.echo(f"\n  {status_icon} [{i}/{total}] {name}: {n} samples ({result.status})")
+
         self._print_summary(results)
         return results
 
@@ -125,7 +153,9 @@ class DataAgent:
         """Run the full ReAct pipeline for one dataset."""
         name = Path(source_path).name
         ds_dir = os.path.join(self.work_dir, name)
+        image_dir = os.path.join(ds_dir, "images")
         os.makedirs(ds_dir, exist_ok=True)
+        os.makedirs(image_dir, exist_ok=True)
 
         result = DatasetResult(
             source_path=source_path,
@@ -134,11 +164,11 @@ class DataAgent:
         )
 
         # ── Phase 1: ReAct exploration + script generation ────
-        click.echo(f"\n  [Phase 1] Exploring data and generating conversion script...")
+        click.echo(f"\n  [1/5] Exploring data and generating conversion script...")
 
         jsonl_path = os.path.join(ds_dir, f"raw_{name}.jsonl")
         script, react_steps = asyncio.run(
-            self._react_loop(source_path, jsonl_path, ds_dir)
+            self._react_loop(source_path, jsonl_path, image_dir)
         )
         result.react_steps = react_steps
 
@@ -155,9 +185,9 @@ class DataAgent:
         result.script_path = script_path
 
         # ── Phase 2: Execute + validate + fix loop ────────────
-        click.echo(f"\n  [Phase 2] Running conversion script...")
+        click.echo(f"\n  [2/5] Running conversion script...")
         script, sandbox_result, attempts = self._run_with_retry(
-            script, source_path, jsonl_path
+            script, source_path, jsonl_path, image_dir=image_dir
         )
         result.script_attempts = attempts
 
@@ -174,13 +204,16 @@ class DataAgent:
             return result
 
         result.raw_jsonl_path = jsonl_path
+        n_imgs = sum(1 for _ in Path(image_dir).glob("*.png")) if Path(image_dir).exists() else 0
         click.echo(f"  Converted {sandbox_result.output_rows} rows → {jsonl_path}")
+        if n_imgs:
+            click.echo(f"  Saved {n_imgs} images → {image_dir}")
 
         # ── Phase 3: Standard post-processing ─────────────────
         from autotrainer.managers.data_pipeline import DataPipeline
         dp = DataPipeline(cache_dir=self.work_dir)
 
-        click.echo(f"\n  [Phase 3] Cleaning (dedup, bad rows)...")
+        click.echo(f"\n  [3/5] Cleaning (dedup, bad rows)...")
         cleaned_path = os.path.join(ds_dir, f"cleaned_{name}.jsonl")
         stats = dp.clean(jsonl_path, cleaned_path)
         result.clean_stats = stats
@@ -197,18 +230,18 @@ class DataAgent:
             result.completed_at = datetime.now().isoformat()
             return result
 
-        click.echo(f"\n  [Phase 4] Profiling...")
+        click.echo(f"\n  [4/5] Profiling...")
         prof = dp.profile(cleaned_path)
         result.profile = prof
         tl = prof.get("text_lengths", {})
-        click.echo(f"    {prof.get('num_samples', 0)} samples, {prof.get('size_mb', 0)}MB")
+        click.echo(f"    {prof.get('num_samples', 0)} samples, {prof.get('size_mb', 0)}MB, images={prof.get('image_count', 0)}")
         if tl:
             click.echo(f"    text: avg={tl.get('avg', 0)} p95={tl.get('p95', 0)}")
         if prof.get("sample_preview"):
             preview = json.dumps(prof["sample_preview"][0], ensure_ascii=False)
             click.echo(f"    preview: {preview[:200]}")
 
-        click.echo(f"\n  [Phase 5] Splitting 90/5/5...")
+        click.echo(f"\n  [5/5] Splitting 90/5/5...")
         split_r = dp.split(cleaned_path)
         result.split = split_r
         click.echo(
@@ -229,7 +262,7 @@ class DataAgent:
         self,
         source_path: str,
         output_path: str,
-        work_dir: str,
+        image_dir: str,
     ) -> tuple[str, int]:
         """Run the ReAct exploration loop.
 
@@ -242,25 +275,23 @@ class DataAgent:
         system_prompt = self._load_skill()
 
         # ── Pre-explore: give LLM the directory tree upfront ──────────────
-        # This avoids wasting steps on "where is the data?" exploration.
         click.echo("    Pre-exploring directory structure...")
         pre_context = self._pre_explore(source_path)
 
-        # Seed the conversation with real file information
         messages = [
             {
                 "role": "user",
                 "content": (
                     f"Dataset absolute path: {source_path}\n"
-                    f"Output JSONL path: {output_path}\n\n"
+                    f"Output JSONL path: {output_path}\n"
+                    f"IMAGE_DIR (save image files here): {image_dir}\n\n"
                     f"=== Directory structure (pre-explored) ===\n"
                     f"{pre_context}\n"
                     f"===========================================\n\n"
-                    f"Based on the above, write a Python script to convert this dataset "
-                    f"to erniekit JSONL format.\n"
-                    f"If you need more detail (e.g., to read a parquet schema or see "
-                    f"first few rows), use shell/python actions. "
-                    f"Otherwise, go directly to final_script."
+                    f"Write a Python script to convert this dataset to erniekit JSONL.\n"
+                    f"- Save image bytes to IMAGE_DIR, reference as ./images/fname\n"
+                    f"- Process large parquet files in chunks of 5000 rows\n"
+                    f"- Go to final_script directly if you have enough info."
                 ),
             }
         ]
@@ -499,6 +530,7 @@ class DataAgent:
         script: str,
         source_path: str,
         output_path: str,
+        image_dir: str = "",
     ) -> tuple[str, SandboxResult, int]:
         """Execute script, validate, fix and retry on failure."""
         last_result = SandboxResult()
@@ -514,7 +546,8 @@ class DataAgent:
                     continue
                 break
 
-            result = self.sandbox.run(script, source_path, output_path)
+            extra_env = {"IMAGE_DIR": image_dir} if image_dir else {}
+            result = self.sandbox.run(script, source_path, output_path, extra_env=extra_env)
             last_result = result
 
             if result.success and result.output_rows > 0:
@@ -630,19 +663,58 @@ print(f"Converted: {count} samples")
         atomic_write_json(index_path, index)
 
     def _print_summary(self, results: list[DatasetResult]):
-        click.echo(f"\n{'═' * 65}")
-        click.echo("  Summary")
-        click.echo(f"{'═' * 65}")
+        from rich.console import Console
+        from rich.table import Table
+        from rich import box
+
+        console = Console()
+        console.print(f"\n{'═' * 65}")
+        console.print("  [bold]Data Processing Summary[/bold]")
+        console.print(f"{'═' * 65}")
+
         completed = [r for r in results if r.status == "completed"]
         failed = [r for r in results if r.status == "failed"]
-        click.echo(f"  Completed: {len(completed)} / {len(results)}")
-        for r in completed:
-            n = r.profile.get("num_samples", 0)
-            train_path = r.split.get("train", {}).get("path", "")
-            click.echo(f"    ✓ {r.dataset_name}: {n} samples → {train_path}")
-        for r in failed:
-            click.echo(f"    ✗ {r.dataset_name}: {r.errors}")
+        skipped = [r for r in results if r.status not in ("completed", "failed")]
+
+        console.print(
+            f"  Total: [bold]{len(results)}[/bold]  "
+            f"[green]✓ {len(completed)}[/green]  "
+            f"[red]✗ {len(failed)}[/red]  "
+            f"[dim]⟳ {len(skipped)} skipped[/dim]"
+        )
+
+        table = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 1))
+        table.add_column("#", width=3)
+        table.add_column("Dataset", width=40, no_wrap=False)
+        table.add_column("Status", width=10)
+        table.add_column("Samples", width=9, justify="right")
+        table.add_column("Images", width=7, justify="right")
+        table.add_column("Train path", width=50, no_wrap=False)
+
+        for i, r in enumerate(results, 1):
+            status_str = (
+                "[green]completed[/green]" if r.status == "completed"
+                else "[red]failed[/red]" if r.status == "failed"
+                else "[dim]skipped[/dim]"
+            )
+            n = r.profile.get("num_samples", "-") if r.profile else "-"
+            imgs = str(r.profile.get("image_count", "-")) if r.profile else "-"
+            train = r.split.get("train", {}).get("path", "") if r.split else ""
+            err = r.errors[0][:50] if r.errors else ""
+            table.add_row(
+                str(i),
+                r.dataset_name,
+                status_str,
+                str(n),
+                imgs,
+                train or err,
+            )
+
+        console.print(table)
+
         if completed:
-            click.echo(f"\n  Ready for training:")
+            console.print("\n  [bold]Ready for training:[/bold]")
             for r in completed:
-                click.echo(f"    train: {r.split.get('train', {}).get('path', '')}")
+                train_path = r.split.get("train", {}).get("path", "")
+                n = r.profile.get("num_samples", 0)
+                console.print(f"    [green]→[/green] {train_path}  ({n} samples)")
