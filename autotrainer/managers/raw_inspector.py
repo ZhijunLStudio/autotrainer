@@ -113,21 +113,34 @@ class RawInspector:
     # Format-specific inspectors
     # ──────────────────────────────────────────────────────────
 
+    # 只认这些后缀为真实数据文件，排除 log/readme/script 等
+    DATA_EXTENSIONS = {".jsonl", ".json", ".csv", ".tsv", ".parquet", ".xml"}
+    # 名字里含这些关键词的文件跳过（下载日志、readme、脚本等）
+    SKIP_NAME_PATTERNS = {"log", "readme", "summary", "license", "download", ".sh", ".md", ".py", ".txt"}
+
+    def _is_data_file(self, p: Path) -> bool:
+        """Return True only if this file looks like actual training data."""
+        suffix = p.suffix.lower()
+        name_lower = p.name.lower()
+        if suffix not in self.DATA_EXTENSIONS:
+            return False
+        # Skip obvious non-data files by name
+        return not any(pat in name_lower for pat in self.SKIP_NAME_PATTERNS)
+
     def _inspect_directory(self, p: Path, r: InspectionResult) -> InspectionResult:
         r.format_hint = "directory"
         entries = sorted(p.iterdir())
         r.structure = [f.name for f in entries]
         r.file_count = sum(1 for e in entries if e.is_file())
 
-        # Total size
+        # Total size (data files only)
         total_bytes = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
         r.total_size_mb = round(total_bytes / 1024 / 1024, 2)
 
-        # Find representative data files
+        # Find representative DATA files (exclude logs, readmes, scripts)
         data_files = [
             e for e in p.rglob("*")
-            if e.is_file() and e.suffix.lower() in
-            {".jsonl", ".json", ".csv", ".tsv", ".parquet", ".xml", ".txt"}
+            if e.is_file() and self._is_data_file(e)
         ]
 
         if data_files:

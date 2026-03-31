@@ -33,13 +33,14 @@ def data_command(
     cfg = AutoTrainerConfig.from_env()
     work_dir = output_dir or os.path.join(cfg.work_dir, "data")
 
-    # Validate paths
+    # Validate paths and expand "collection directories"
     valid_paths = []
     for p in paths:
-        if os.path.exists(p):
-            valid_paths.append(p)
-        else:
+        if not os.path.exists(p):
             click.echo(f"  [WARN] Path not found: {p}", err=True)
+            continue
+        expanded = _expand_path(p)
+        valid_paths.extend(expanded)
 
     if not valid_paths:
         click.echo("Error: no valid data paths provided.", err=True)
@@ -89,6 +90,57 @@ def data_command(
     )
 
     agent.run(valid_paths)
+
+
+def _expand_path(path: str) -> list[str]:
+    """Expand a path to a list of paths to process.
+
+    Rules:
+    - If it's a file → return [path]
+    - If it's a directory that contains data files at the top level → return [path]
+    - If it's a directory whose top-level entries are ALL subdirectories
+      (e.g. a downloads collection) → return each subdirectory
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.is_dir():
+        return [path]
+
+    # Data file extensions we care about
+    DATA_EXT = {".jsonl", ".json", ".csv", ".tsv", ".parquet", ".xml"}
+
+    top_files = [e for e in p.iterdir() if e.is_file() and e.suffix.lower() in DATA_EXT]
+    top_dirs = [e for e in p.iterdir() if e.is_dir() and not e.name.startswith(".")]
+
+    if top_files:
+        # Has data files at top level → treat as a single dataset
+        return [path]
+
+    if top_dirs and not top_files:
+        # No data files at top level, only subdirs → treat each subdir as a dataset
+        # Filter out obviously empty or non-data directories
+        dataset_dirs = []
+        for d in sorted(top_dirs):
+            # Check that the subdir actually has data files somewhere inside
+            has_data = any(
+                f.suffix.lower() in DATA_EXT
+                for f in d.rglob("*") if f.is_file()
+            )
+            if has_data:
+                dataset_dirs.append(str(d))
+
+        if dataset_dirs:
+            click.echo(
+                f"\n  Detected collection directory with {len(dataset_dirs)} datasets."
+            )
+            click.echo("  Will process each subdirectory as a separate dataset:\n")
+            for i, d in enumerate(dataset_dirs, 1):
+                click.echo(f"    [{i:>2}] {os.path.basename(d)}")
+            click.echo()
+            return dataset_dirs
+
+    return [path]
 
 
 def _build_llm_client(cfg):
