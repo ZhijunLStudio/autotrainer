@@ -2,18 +2,19 @@
 
 LLM-driven automated training system for [PaddleFormers](https://github.com/PaddlePaddle/PaddleFormers). Starting with PaddleOCR-VL, designed to extend to other large models.
 
-AutoTrainer automates the full training lifecycle: environment setup, data search/download/format conversion, ablation experiments, hyperparameter tuning, training, evaluation, and reporting — with LLM-powered decision-making at each step.
+AutoTrainer automates the full ML lifecycle: data processing, environment setup, ablation experiments, training, evaluation, and reporting — with LLM-powered decision-making at each step.
 
 ## Features
 
+- **ReAct Data Agent** — inspects any data format (Parquet, CSV, XML, JSONL, ZIP, directory), writes a conversion script via LLM, executes it, validates, auto-fixes on failure
 - **3 Skills** (LLM capabilities, called on-demand):
-  - `diagnose-training` — analyzes training errors (OOM, NaN, NCCL, etc.) and suggests fixes
-  - `plan-experiment` — plans ablation experiments and next-step parameter tuning
-  - `data-intel` — searches, validates, profiles, and converts training datasets
+  - `data-inspect` — understands data schema and generates erniekit conversion scripts
+  - `diagnose-training` — two-tier error diagnosis (regex fast-path + LLM for complex cases)
+  - `plan-experiment` — ablation strategy, parameter tuning, experiment ranking
 - **TUI** — real-time terminal interface with collapsible panels, smart log display, GPU monitoring
 - **Ablation Engine** — single-factor → multi-factor → full training, all on small subsets first
-- **Crash Recovery** — WAL-style state persistence, can resume from any interrupted phase
-- **Health Watchdog** — background monitoring of GPU, process, log freshness, hang detection
+- **Crash Recovery** — WAL-style state persistence, resume from any interrupted phase
+- **Health Watchdog** — GPU monitoring, hang detection, process alive checks
 - **Context Management** — percentage-based token budgets, raw logs never enter LLM context
 
 ## Installation
@@ -21,18 +22,13 @@ AutoTrainer automates the full training lifecycle: environment setup, data searc
 ```bash
 git clone https://github.com/ZhijunLStudio/autotrainer.git
 cd autotrainer
-
-# Basic install (HF search + validate + train)
 pip install -e .
+```
 
-# With Tavily semantic search
-pip install -e '.[search]'
-
-# With OpenDataLab data source
-pip install -e '.[data]'
-
-# Everything
-pip install -e '.[all]'
+Optional extras:
+```bash
+pip install -e '.[search]'   # Tavily semantic search for data discovery
+pip install -e '.[all]'      # Everything
 ```
 
 ## Quick Start
@@ -40,40 +36,38 @@ pip install -e '.[all]'
 ```bash
 # 1. Initialize config
 autotrainer init
-# Edit ~/.autotrainer/config.yaml to set your paths and API keys
+# Edit ~/.autotrainer/config.yaml
 
-# 2. Prepare data (validate + profile)
-autotrainer data --mode fixed --task paddleocr-vl --data-path /path/to/data.jsonl
+# 2. Process your data (any format)
+autotrainer data --path /path/to/your/ocr_data/
 
-# 3. Run the full pipeline (TUI mode)
+# 3. Start training (TUI mode)
 autotrainer run --task paddleocr-vl
-
-# 4. Or run headless
-autotrainer run --task paddleocr-vl --no-tui
 ```
 
 ## Configuration
 
-Config file at `~/.autotrainer/config.yaml`:
+Config file: `~/.autotrainer/config.yaml` (created by `autotrainer init`)
 
 ```yaml
-paddleformers_root: "/path/to/PaddleFormers"
+paddleformers_root: "/path/to/PaddleFormers"  # auto-detected if empty
 
 llm:
   base_url: "http://localhost:8000/v1"  # OpenAI-compatible API
   api_key: "sk-xxx"
-  model: "your-model-name"
+  model: "your-model-name"             # e.g. qwen-72b
 
-tavily_api_key: ""  # Optional, for broader data search
+search:
+  tavily_api_key: ""       # https://tavily.com — for data discovery
+  modelscope_token: ""     # https://modelscope.cn — optional
 
 training:
-  ablation_subset_ratio: 0.05
+  ablation_subset_ratio: 0.05   # fraction of data for ablation
   ablation_max_steps: 1000
   full_epochs: 3
 ```
 
-Environment variables also work (config file < env vars < CLI args):
-
+Environment variables override config file values:
 ```bash
 export PADDLEFORMERS_ROOT="/path/to/PaddleFormers"
 export AUTOTRAINER_LLM_BASE_URL="http://localhost:8000/v1"
@@ -92,71 +86,98 @@ Create the default config file at `~/.autotrainer/config.yaml`.
 autotrainer init
 ```
 
+---
+
 ### `autotrainer data`
 
-Manage training datasets in 3 modes.
+Process training data using a LLM-driven ReAct agent.
 
-**Mode 1: `fixed`** — Validate, profile, and prepare existing data.
+The agent automatically:
+1. Explores the data directory (`ls`, `head`, parquet schema inspection)
+2. Generates a Python conversion script tailored to this specific dataset
+3. Executes the script, validates output format
+4. Auto-fixes and retries on failure (up to 3 attempts)
+5. Cleans (dedup by MD5, remove bad rows), profiles, splits train/val/test
 
-```bash
-autotrainer data --mode fixed --task paddleocr-vl --data-path /data/train.jsonl
-
-# With output (saves data_profile.json)
-autotrainer data --mode fixed --task paddleocr-vl --data-path /data/train.jsonl --output-dir /data/profiles
-```
-
-Output includes: format validation, sample count, text length distribution, quality flags, sample preview.
-
-**Mode 2: `expand`** — Find additional datasets to complement your existing data.
+**Supported input formats:** JSONL, JSON, CSV, TSV, Parquet, XML, ZIP, directories (any nesting)
 
 ```bash
-autotrainer data --mode expand --task paddleocr-vl --data-path /data/existing.jsonl
+# Process a single directory (each subdirectory = one dataset)
+autotrainer data --path /data/arabic_ocr_datasets/
+
+# Process specific files (multiple --path flags)
+autotrainer data --path /data/train.parquet --path /data/annotations.json
+
+# Custom output directory (default: ./autotrainer_output/)
+autotrainer data --path /data/ocr/ --output-dir /data/processed/
+
+# Profile existing JSONL without conversion
+autotrainer data --path /data/cleaned.jsonl --profile-only
+
+# Split existing JSONL into train/val/test (90/5/5)
+autotrainer data --path /data/cleaned.jsonl --split-only
 ```
 
-**Mode 3: `discover`** — Search for datasets from scratch.
-
-```bash
-# Default search (auto-generates query from task)
-autotrainer data --mode discover --task paddleocr-vl
-
-# Custom search query
-autotrainer data --mode discover --task paddleocr-vl --query "Chinese handwritten OCR recognition dataset"
+**Output structure per dataset:**
+```
+autotrainer_output/
+  <dataset_name>/
+    convert_script.py      ← LLM-generated conversion script (reusable)
+    raw_<name>.jsonl       ← raw conversion output
+    cleaned_<name>.jsonl   ← after dedup + bad row removal
+    images/                ← image files saved from bytes columns
+      img_00000000.png
+      ...
+    cleaned_<name>_train.jsonl
+    cleaned_<name>_val.jsonl
+    cleaned_<name>_test.jsonl
+  data_index.json          ← all dataset records (supports resume)
 ```
 
-Searches HuggingFace Hub (always) + Tavily (if API key configured). Results show ID, source, download count.
+**Resume support:** Re-running `autotrainer data` skips already-completed datasets automatically.
 
-After finding a dataset, download it and validate:
+**Without LLM:** Falls back to a passthrough script (works for already-erniekit JSONL data).
 
-```bash
-huggingface-cli download <repo_id>
-autotrainer data --mode fixed --task paddleocr-vl --data-path /path/to/downloaded.jsonl
+**Target format (erniekit JSONL):**
+```json
+{
+  "image_info": [{"image_url": "./images/img_00000000.png", "matched_text_index": 0}],
+  "text_info": [
+    {"text": "Read the Arabic text in the image.", "tag": "mask"},
+    {"text": "الجدائية", "tag": "no_mask"}
+  ]
+}
 ```
+
+---
 
 ### `autotrainer run`
 
 Start the automated training pipeline.
 
 ```bash
-# TUI mode (default)
+# TUI mode (default, recommended)
 autotrainer run --task paddleocr-vl
 
 # Specify GPUs
 autotrainer run --task paddleocr-vl --gpus 0,1,2,3
 
-# Headless mode (no TUI)
+# Headless mode (no TUI, for scripts)
 autotrainer run --task paddleocr-vl --no-tui
 
 # Resume interrupted training
 autotrainer run --task paddleocr-vl --resume
 ```
 
-The pipeline runs through these phases:
-1. **Data Prepare** — validate, profile, split train/val/test, create 5% ablation subset
+Pipeline phases:
+1. **Data Prepare** — validate, profile, split, create 5% ablation subset
 2. **Env Check** — verify PaddlePaddle, packages, GPU (interactive if issues found)
-3. **Ablation** — single-factor experiments on 5% subset, rank results
-4. **Full Training** — best config on full data, with health watchdog
+3. **Ablation** — single-factor experiments on 5% subset, LLM ranks results
+4. **Full Training** — best config on full data, health watchdog active
 5. **Evaluation** — eval metrics + sample inference verification
-6. **Report** — generate charts and summary
+6. **Report** — visualizations and summary
+
+---
 
 ### `autotrainer status`
 
@@ -166,75 +187,109 @@ Show current pipeline and experiment status.
 autotrainer status
 ```
 
+---
+
 ### `autotrainer resume`
 
-View recovery state and instructions for resuming.
+Show recovery state and resume instructions.
 
 ```bash
 autotrainer resume
 ```
+
+---
 
 ### `autotrainer report`
 
 Generate experiment reports.
 
 ```bash
-# Text summary
-autotrainer report --format text
-
-# HTML with charts
-autotrainer report --format html
-
-# JSON
-autotrainer report --format json
+autotrainer report --format text    # text summary
+autotrainer report --format html    # HTML with charts
+autotrainer report --format json    # raw JSON
 ```
+
+---
+
+## Download Helper Scripts
+
+Pre-built download scripts for common OCR datasets:
+
+```bash
+# Download Arabic OCR datasets from HuggingFace (14 datasets)
+bash scripts/download_arabic_ocr.sh /data/arabic_ocr_datasets
+
+# High-priority only (~4.5GB, fastest to get started)
+bash scripts/download_arabic_ocr.sh /data/arabic_ocr_datasets high
+```
+
+Then process them:
+```bash
+autotrainer data --path /data/arabic_ocr_datasets/
+```
+
+---
 
 ## Skills
 
-Skills are self-contained LLM capabilities invoked during the pipeline. Each skill has a `SKILL.md` (prompt) and a `handler.py` (Python logic).
+Skills are self-contained LLM capability modules (`SKILL.md` prompt + `handler.py` logic).
+
+### `data-inspect`
+Understands raw data of any format and writes a Python conversion script to produce erniekit JSONL. Works as a ReAct agent: uses shell/python exploration actions, then outputs `final_script`.
+
+### `data-fix`
+Repairs a broken conversion script given an error message and data samples.
 
 ### `diagnose-training`
-
-Two-tier error diagnosis:
-- **Tier 1** (instant): Regex pattern matching for common errors (OOM, NaN, NCCL, data format, checkpoint)
-- **Tier 2** (LLM): For complex/unknown errors, sends structured context to LLM for analysis
+Two-tier training error diagnosis:
+- **Tier 1** (instant, no LLM): regex matching for OOM / NaN / NCCL / data format errors
+- **Tier 2** (LLM): complex or unknown errors with full context analysis
 
 ### `plan-experiment`
+LLM-driven experiment planning:
+- Single-factor ablation grid design
+- Ranks results and suggests next experiments
+- Multi-factor combination selection
 
-Experiment planning and ablation strategy:
-- Plans single-factor ablation grid (which factors to test, which values)
-- Ranks experiment results and suggests next experiments
-- Identifies optimal config combinations
-
-### `data-intel`
-
-Dataset intelligence in 3 modes (fixed/expand/discover):
-- Validates JSONL format against PaddleFormers schemas (erniekit, messages)
-- Generates statistical profiles (sample counts, length distributions, quality)
-- Searches across HuggingFace Hub + Tavily for datasets
+---
 
 ## TUI Keybindings
 
 | Key | Action |
 |-----|--------|
 | `Tab` | Toggle agent panel |
-| `l` | Toggle log mode (smart/full) |
+| `l` | Toggle log mode (smart / full) |
 | `s` | Show status |
 | `q` | Quit |
+
+---
 
 ## Project Structure
 
 ```
 autotrainer/
   autotrainer/
-    cli/              # Click CLI commands
+    cli/              # Click CLI: init, data, run, status, resume, report
     tui/              # Textual TUI app, widgets, screens
-    orchestrator/     # Pipeline orchestrator, state machine, recovery, health monitor
-    managers/         # env, data, train, eval managers
-    context/          # Context store with percentage-based token budgets
-    skills/           # 3 skills: diagnose-training, plan-experiment, data-intel
+    orchestrator/     # PipelineOrchestrator, PhaseManager, recovery, health monitor
+    managers/
+      data_agent.py   # ReAct data processing agent
+      data_pipeline.py # clean, profile, split utilities
+      raw_inspector.py # universal data sampler (pre-explore for LLM)
+      sandbox.py      # controlled subprocess execution for LLM-generated scripts
+      env_manager.py  # environment verification
+      train_manager.py # training subprocess management
+      eval_manager.py  # evaluation
+    context/          # ContextStore with percentage-based token budgets
+    skills/
+      data_inspect/   # SKILL.md + handler: understand data → write conversion script
+      data_fix/       # SKILL.md + handler: repair broken scripts
+      diagnose_training/  # SKILL.md + handler + patterns: error diagnosis
+      plan_experiment/    # SKILL.md + handler + strategy: ablation planning
     pf_integration/   # PaddleFormers config builder, launcher, log parser, validators
     utils/            # subprocess manager, file utils, GPU monitor, LLM client
+  scripts/
+    download_arabic_ocr.sh  # batch download script for Arabic OCR datasets
 ```
 
 ## License

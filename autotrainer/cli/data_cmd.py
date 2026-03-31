@@ -1,151 +1,180 @@
-"""Data command — manage datasets in 3 modes."""
+"""Data command — LLM-driven data processing pipeline.
+
+Usage:
+  # Process one or more data files/directories
+  autotrainer data --path /data/ocr1.jsonl --path /data/ocr2/
+  autotrainer data --path /data/ocr/ --output-dir /data/processed
+
+  # Profile existing processed data (no LLM needed)
+  autotrainer data --path /data/processed.jsonl --profile-only
+
+  # Split existing JSONL
+  autotrainer data --path /data/cleaned.jsonl --split-only
+"""
 
 from __future__ import annotations
 
-import json
 import os
 
 import click
 
 
-def data_command(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None = None):
-    """Execute the data management command."""
+def data_command(
+    paths: list[str],
+    output_dir: str | None,
+    profile_only: bool = False,
+    split_only: bool = False,
+    custom_script: str | None = None,
+    parallel: int = 1,
+):
+    """Execute the data agent pipeline."""
     from autotrainer.config import AutoTrainerConfig
-    from autotrainer.skills.data_intel.handler import DataIntelHandler
+    from autotrainer.managers.data_agent import DataAgent
+    from autotrainer.managers.data_pipeline import DataPipeline
 
     cfg = AutoTrainerConfig.from_env()
-    cache_dir = output_dir or cfg.work_dir
-    handler = DataIntelHandler(cache_dir=cache_dir)
+    # Default: save to ./autotrainer_output/ in current working directory
+    work_dir = output_dir or os.path.join(os.getcwd(), "autotrainer_output")
 
-    if mode == "fixed":
-        _handle_fixed(handler, data_path, task, output_dir)
-    elif mode in ("expand", "discover"):
-        _handle_search(handler, task, data_path, cfg, expand=(mode == "expand"), custom_query=query)
+    # Validate paths, make absolute, and expand "collection directories"
+    valid_paths = []
+    for p in paths:
+        abs_p = os.path.abspath(p)          # always resolve to absolute path
+        if not os.path.exists(abs_p):
+            click.echo(f"  [WARN] Path not found: {abs_p}", err=True)
+            continue
+        expanded = _expand_path(abs_p)
+        valid_paths.extend(expanded)
 
-
-def _handle_fixed(handler, data_path: str | None, task: str, output_dir: str | None):
-    """Mode 1: Validate, profile, and prepare existing data."""
-    if not data_path:
-        click.echo("Error: --data-path is required for fixed mode.", err=True)
+    if not valid_paths:
+        click.echo("Error: no valid data paths provided.", err=True)
         raise SystemExit(1)
 
-    click.echo(f"Validating and profiling: {data_path}")
-    result = handler.handle_fixed_mode(data_path, task)
+    dp = DataPipeline(cache_dir=work_dir)
 
-    # Validation
-    validation = result.get("validation", {})
-    if validation.get("valid"):
-        click.echo("  [OK] Data format is valid")
-    else:
-        click.echo("  [FAIL] Data format errors:")
-        for err in validation.get("errors", [])[:10]:
-            click.echo(f"    - {err}")
+    # Profile-only mode (no LLM, no conversion)
+    if profile_only:
+        for path in valid_paths:
+            click.echo(f"\nProfiling: {path}")
+            if not path.endswith(".jsonl"):
+                click.echo("  [WARN] profile-only works on JSONL files")
+                continue
+            prof = dp.profile(path)
+            _print_profile(prof)
+        return
 
-    for warn in validation.get("warnings", [])[:5]:
-        click.echo(f"  [WARN] {warn}")
+    # Split-only mode
+    if split_only:
+        for path in valid_paths:
+            click.echo(f"\nSplitting: {path}")
+            result = dp.split(path)
+            click.echo(
+                f"  train={result['train']['count']} → {result['train']['path']}\n"
+                f"  val  ={result['val']['count']}   → {result['val']['path']}\n"
+                f"  test ={result['test']['count']}  → {result['test']['path']}"
+            )
+        return
 
-    # Profile
-    profile = result.get("profile", {})
-    click.echo(f"\n  Format: {profile.get('format', 'unknown')}")
-    click.echo(f"  Samples: {profile.get('num_samples', 0)}")
-    click.echo(f"  Has images: {profile.get('has_images', False)}")
-    click.echo(f"  Size: {profile.get('total_size_mb', 0):.1f} MB")
-
-    text_lens = profile.get("text_lengths", {})
-    if text_lens:
+    # Full agent pipeline
+    llm_client = _build_llm_client(cfg)
+    if not llm_client:
         click.echo(
-            f"  Text lengths: min={text_lens.get('min', 0)}, avg={text_lens.get('avg', 0)}, max={text_lens.get('max', 0)}"
+            "\n  [INFO] No LLM configured. Running without auto-conversion.\n"
+            "  Add LLM settings to ~/.autotrainer/config.yaml for automatic\n"
+            "  format conversion of non-JSONL data.\n"
         )
 
-    for rec in result.get("recommendations", []):
-        click.echo(f"  [RECOMMEND] {rec}")
+    from autotrainer.context.store import ContextStore
+    context = ContextStore(max_tokens=cfg.context_max_tokens)
 
-    # Save profile
-    if output_dir:
-        profile_path = os.path.join(output_dir, "data_profile.json")
-        with open(profile_path, "w") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        click.echo(f"\n  Profile saved to: {profile_path}")
+    agent = DataAgent(
+        work_dir=work_dir,
+        llm_client=llm_client,
+        context_store=context,
+    )
+
+    agent.run(valid_paths, custom_script=custom_script, parallel=parallel)
 
 
-def _handle_search(
-    handler,
-    task: str,
-    data_path: str | None,
-    cfg,
-    expand: bool = False,
-    custom_query: str | None = None,
-):
-    """Mode 2/3: Search for datasets (expand or discover).
+def _expand_path(path: str) -> list[str]:
+    """Expand a path to a list of paths to process.
 
-    If custom_query is provided, use that instead of the default task-based query.
+    Rules:
+    - If it's a file → return [path]
+    - If it's a directory that contains data files at the top level → return [path]
+    - If it's a directory whose top-level entries are ALL subdirectories
+      (e.g. a downloads collection) → return each subdirectory
     """
-    from autotrainer.managers.data_manager import DataManager
+    from pathlib import Path
 
-    dm = DataManager(cache_dir=cfg.work_dir, paddleformers_root=cfg.paddleformers_root)
+    p = Path(path)
+    if not p.is_dir():
+        return [path]
 
-    # Build search query
-    if custom_query:
-        search_query = custom_query
-        click.echo(f"Searching with custom query: {search_query}")
-    else:
-        search_query = f"{task} OCR training dataset"
-        if expand and data_path:
-            click.echo(f"Searching for additional datasets to complement: {data_path}")
-        else:
-            click.echo(f"Searching for datasets: {search_query}")
+    # Data file extensions we care about
+    DATA_EXT = {".jsonl", ".json", ".csv", ".tsv", ".parquet", ".xml"}
 
-    # Source 1: HuggingFace Hub
-    click.echo(f"\n  [1/3] Searching HuggingFace Hub for: {search_query}")
-    hf_results = dm.search_hf(query=search_query, limit=10)
-    click.echo(f"        Found {len(hf_results)} results")
+    top_files = [e for e in p.iterdir() if e.is_file() and e.suffix.lower() in DATA_EXT]
+    top_dirs = [e for e in p.iterdir() if e.is_dir() and not e.name.startswith(".")]
 
-    # Source 2: Tavily (if configured)
-    tavily_results = []
-    tavily_key = os.environ.get("TAVILY_API_KEY", "")
-    if not tavily_key:
-        try:
-            import yaml
+    if top_files:
+        # Has data files at top level → treat as a single dataset
+        return [path]
 
-            with open(os.path.expanduser("~/.autotrainer/config.yaml")) as f:
-                tavily_key = (yaml.safe_load(f) or {}).get("tavily_api_key", "")
-        except Exception:
-            pass
+    if top_dirs and not top_files:
+        # No data files at top level, only subdirs → treat each subdir as a dataset
+        # Filter out obviously empty or non-data directories
+        dataset_dirs = []
+        for d in sorted(top_dirs):
+            # Check that the subdir actually has data files somewhere inside
+            has_data = any(
+                f.suffix.lower() in DATA_EXT
+                for f in d.rglob("*") if f.is_file()
+            )
+            if has_data:
+                dataset_dirs.append(str(d))
 
-    click.echo(f"  [2/3] Searching Tavily...")
-    if tavily_key:
-        tavily_results = dm.search_tavily(query=f"{search_query} huggingface dataset", api_key=tavily_key)
-        click.echo(f"        Found {len(tavily_results)} results")
-    else:
-        click.echo("        Skipped (no API key)")
-        click.echo("        To enable: pip install autotrainer[search]")
-        click.echo("        Then add tavily_api_key to ~/.autotrainer/config.yaml")
+        if dataset_dirs:
+            click.echo(
+                f"\n  Detected collection directory with {len(dataset_dirs)} datasets."
+            )
+            click.echo("  Will process each subdirectory as a separate dataset:\n")
+            for i, d in enumerate(dataset_dirs, 1):
+                click.echo(f"    [{i:>2}] {os.path.basename(d)}")
+            click.echo()
+            return dataset_dirs
 
-    # Source 3: Show results
-    click.echo(f"  [3/3] Compiling results...")
+    return [path]
 
-    all_candidates = []
-    for r in hf_results:
-        all_candidates.append({**r, "source": "huggingface"})
-    for r in tavily_results:
-        if "error" not in r:
-            all_candidates.append(r)
 
-    click.echo(f"\n  Total candidates: {len(all_candidates)}")
-    click.echo(f"  {'#':<4} {'ID/Title':<40} {'Source':<14} {'Info'}")
-    click.echo(f"  {'-' * 80}")
+def _build_llm_client(cfg):
+    """Build LLM client from config if available."""
+    if not cfg.llm_base_url or not cfg.llm_model:
+        return None
+    try:
+        from autotrainer.utils.llm_client import LLMClient
+        return LLMClient(
+            base_url=cfg.llm_base_url,
+            api_key=cfg.llm_api_key,
+            model=cfg.llm_model,
+        )
+    except Exception:
+        return None
 
-    for i, c in enumerate(all_candidates[:15], 1):
-        name = c.get("id") or c.get("title", "?")[:38]
-        source = c.get("source", "?")
-        if source == "huggingface":
-            info = f"downloads={c.get('downloads', 0)}"
-        else:
-            info = c.get("snippet", "")[:40]
-        click.echo(f"  {i:<4} {name:<40} {source:<14} {info}")
 
-    # Download instructions
-    if all_candidates:
-        click.echo(f"\n  To download a dataset:")
-        click.echo(f"    HuggingFace: huggingface-cli download <repo_id>")
-        click.echo(f"    Then run:    autotrainer data --mode fixed --task {task} --data-path <path>")
+def _print_profile(prof: dict):
+    """Print a dataset profile summary."""
+    click.echo(f"  Format:  {prof.get('format', '?')}")
+    click.echo(f"  Samples: {prof.get('num_samples', 0)}")
+    click.echo(f"  Size:    {prof.get('size_mb', 0)} MB")
+    click.echo(f"  Images:  {prof.get('image_count', 0)}")
+    tl = prof.get("text_lengths", {})
+    if tl:
+        click.echo(f"  Text:    avg={tl.get('avg', 0)} p95={tl.get('p95', 0)} max={tl.get('max', 0)}")
+    fc = prof.get("field_coverage", {})
+    if fc:
+        click.echo(f"  Fields:  {fc}")
+    if prof.get("sample_preview"):
+        import json
+        preview = json.dumps(prof["sample_preview"][0], ensure_ascii=False)
+        click.echo(f"  Preview: {preview[:250]}")
