@@ -180,13 +180,13 @@ class AutoTrainerConfig:
         file_cfg = _load_config_file(config_file)
         if file_cfg:
             # Flat mapping from YAML structure to flat dict
-            cfg["work_dir"] = file_cfg.get("work_dir", cfg["work_dir"])
+            raw_work_dir = file_cfg.get("work_dir", cfg["work_dir"])
+            cfg["work_dir"] = os.path.expanduser(raw_work_dir)  # expand ~ properly
             cfg["paddleformers_root"] = file_cfg.get("paddleformers_root", cfg["paddleformers_root"])
             cfg["skills_dir"] = file_cfg.get("skills_dir", cfg["skills_dir"])
 
             llm = file_cfg.get("llm", {})
-            search = file_cfg.get("search", {})
-            # support both old flat key and new nested key
+            search = file_cfg.get("search", {})  # noqa: F841 — used below via search.get(...)
             cfg["llm_base_url"] = llm.get("base_url", cfg["llm_base_url"])
             cfg["llm_api_key"] = llm.get("api_key", cfg["llm_api_key"])
             cfg["llm_model"] = llm.get("model", cfg["llm_model"])
