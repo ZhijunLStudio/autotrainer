@@ -155,9 +155,21 @@ class DataAgent:
             st = dashboard.get_status(path)
 
             def _notify(phase, message="", log_line=""):
-                if st:
-                    st.update(phase, message, log_line)
+                if not st:
+                    return
+                # Handle step tracking messages
+                if message and message.startswith("__step_start__:"):
+                    action = message.replace("__step_start__:", "")
+                    st.step_start(action)
                     dashboard.refresh()
+                    return
+                if message and message.startswith("__step_end__:"):
+                    result_str = message.replace("__step_end__:", "")
+                    st.step_finish(result_str)
+                    dashboard.refresh()
+                    return
+                st.update(phase, message, log_line)
+                dashboard.refresh()
 
             result = self._process_one(path, custom_script=custom_script, notify=_notify)
             if st:
@@ -216,6 +228,14 @@ class DataAgent:
             if notify:
                 notify(phase, msg, log)
 
+        def _step(action):
+            if notify:
+                notify(None, f"__step_start__:{action}")
+
+        def _step_end(result="OK"):
+            if notify:
+                notify(None, f"__step_end__:{result}")
+
         name = Path(source_path).name
         ds_dir = os.path.join(self.work_dir, name)
         image_dir = os.path.join(ds_dir, "images")
@@ -232,15 +252,19 @@ class DataAgent:
 
         # ── Phase 1: Get conversion script ────────────────────
         if custom_script:
+            _step("reading manual script")
             _n(DPhase.GENERATING, f"using manual script")
             with open(custom_script, "r") as f:
                 script = f.read()
+            _step_end("loaded")
             result.react_steps = 0
         else:
+            _step("pre-exploring directory + generating script")
             _n(DPhase.EXPLORING, "pre-exploring directory structure")
             script, react_steps = asyncio.run(
                 self._react_loop(source_path, jsonl_path, image_dir, notify=notify)
             )
+            _step_end(f"{react_steps} steps")
             result.react_steps = react_steps
 
         if not script:
@@ -251,12 +275,15 @@ class DataAgent:
             return result
 
         # Save the final script
+        _step("saving script to file")
         script_path = os.path.join(ds_dir, "convert_script.py")
         with open(script_path, "w") as f:
             f.write(script)
         result.script_path = script_path
+        _step_end("saved")
 
         # ── Phase 2: Execute + validate + fix loop ────────────
+        _step("running conversion script")
         _n(DPhase.VALIDATING, f"quick validation (100 rows)")
         script, sandbox_result, attempts = self._run_with_retry(
             script, source_path, jsonl_path, image_dir=image_dir, notify=notify
@@ -280,16 +307,19 @@ class DataAgent:
 
         result.raw_jsonl_path = jsonl_path
         n_imgs = sum(1 for _ in Path(image_dir).glob("*.png")) if Path(image_dir).exists() else 0
+        _step_end(f"{sandbox_result.output_rows} rows")
         _n(DPhase.CLEANING, f"{sandbox_result.output_rows} rows converted")
 
         # ── Phase 3: Standard post-processing ─────────────────
         from autotrainer.managers.data_pipeline import DataPipeline
         dp = DataPipeline(cache_dir=self.work_dir)
 
+        _step("cleaning (dedup, bad rows)")
         cleaned_path = os.path.join(ds_dir, f"cleaned_{name}.jsonl")
         stats = dp.clean(jsonl_path, cleaned_path)
         result.clean_stats = stats
         result.cleaned_path = cleaned_path
+        _step_end(f"{stats['output_lines']} rows")
 
         if stats["output_lines"] == 0:
             result.status = "failed"
@@ -298,10 +328,13 @@ class DataAgent:
             _n(DPhase.FAILED, "zero rows after cleaning")
             return result
 
+        _step("profiling dataset")
         _n(DPhase.PROFILING, f"{stats['output_lines']} rows after cleaning")
         prof = dp.profile(cleaned_path)
         result.profile = prof
+        _step_end(f"{prof.get('num_samples', 0)} samples")
 
+        _step("splitting train/val/test (90/5/5)")
         _n(DPhase.SPLITTING, f"{prof.get('num_samples', 0)} samples")
         split_r = dp.split(cleaned_path)
         result.split = split_r
