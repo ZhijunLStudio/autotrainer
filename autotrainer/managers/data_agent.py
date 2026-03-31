@@ -1,17 +1,15 @@
-"""DataAgent — orchestrates the complete data processing pipeline.
+"""DataAgent — ReAct-style agent for data processing.
 
-Flow per dataset:
-  1. inspect()       — sample raw data, infer schema
-  2. generate_script() — LLM writes a conversion script
-  3. sandbox.run()   — execute the script
-  4. validate()      — check output is valid erniekit JSONL
-  5. fix_script()    — if failed, LLM repairs and retries (up to MAX_RETRY)
-  6. clean()         — dedup, remove bad rows, normalize
-  7. profile()       — statistics + sample preview
-  8. split()         — train / val / test
+The agent works in a think → act → observe loop:
+1. LLM thinks about what to do next
+2. Executes a shell command or Python snippet
+3. Observes the output
+4. Repeats until it produces a final conversion script
 
-Context is managed via ContextStore (budget-based).
-All decisions are logged to experiment_index for reproducibility.
+This is fundamentally different from hardcoded inspection:
+- The agent can handle any data format
+- It uses the same tools a human would (ls, head, python, etc.)
+- It adapts based on what it sees
 """
 
 from __future__ import annotations
@@ -19,8 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
-import time
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,14 +26,14 @@ from pathlib import Path
 import click
 
 from autotrainer.context.store import ContextStore
-from autotrainer.managers.raw_inspector import RawInspector, InspectionResult
 from autotrainer.managers.sandbox import Sandbox, SandboxResult
 from autotrainer.pf_integration.dataset_validator import DatasetValidator
 from autotrainer.utils.file_utils import atomic_write_json, safe_read_json
 
 
-MAX_RETRY = 3       # how many times to try fixing the script
-MAX_SCRIPT_TOKENS = 3000   # limit script size going into context
+MAX_REACT_STEPS = 15     # max exploration steps per dataset
+MAX_RETRY_SCRIPT = 3     # max times to retry fixing the script
+MAX_CMD_OUTPUT = 3000    # truncate command output to this length for context
 
 
 @dataclass
@@ -44,15 +42,15 @@ class DatasetResult:
 
     source_path: str = ""
     dataset_name: str = ""
-    format_identified: str = ""
-    script_path: str = ""          # saved conversion script
-    raw_jsonl_path: str = ""       # output of conversion script
+    script_path: str = ""
+    raw_jsonl_path: str = ""
     cleaned_path: str = ""
-    split: dict = field(default_factory=dict)   # {train, val, test} -> {path, count}
+    split: dict = field(default_factory=dict)
     profile: dict = field(default_factory=dict)
     clean_stats: dict = field(default_factory=dict)
-    attempts: int = 0
-    status: str = "pending"        # pending / completed / failed
+    react_steps: int = 0
+    script_attempts: int = 0
+    status: str = "pending"
     errors: list[str] = field(default_factory=list)
     started_at: str = ""
     completed_at: str = ""
@@ -61,14 +59,14 @@ class DatasetResult:
         return {
             "source_path": self.source_path,
             "dataset_name": self.dataset_name,
-            "format_identified": self.format_identified,
             "script_path": self.script_path,
             "raw_jsonl_path": self.raw_jsonl_path,
             "cleaned_path": self.cleaned_path,
             "split": self.split,
             "profile": self.profile,
             "clean_stats": self.clean_stats,
-            "attempts": self.attempts,
+            "react_steps": self.react_steps,
+            "script_attempts": self.script_attempts,
             "status": self.status,
             "errors": self.errors,
             "started_at": self.started_at,
@@ -77,7 +75,7 @@ class DatasetResult:
 
 
 class DataAgent:
-    """LLM-driven data processing agent."""
+    """ReAct agent for data processing."""
 
     def __init__(
         self,
@@ -89,49 +87,41 @@ class DataAgent:
         self.work_dir = work_dir
         self.llm = llm_client
         self.context = context_store or ContextStore()
-        self.inspector = RawInspector()
         self.sandbox = Sandbox(timeout=sandbox_timeout)
         self.validator = DatasetValidator()
-
-        # Lazy-import skill handlers (avoid circular import)
-        self._inspect_handler = None
-        self._fix_handler = None
-
+        self._skill_md: str | None = None
         os.makedirs(work_dir, exist_ok=True)
 
-    def _get_inspect_handler(self):
-        if self._inspect_handler is None:
-            from autotrainer.skills.data_inspect.handler import DataInspectHandler
-            self._inspect_handler = DataInspectHandler(llm_client=self.llm)
-        return self._inspect_handler
-
-    def _get_fix_handler(self):
-        if self._fix_handler is None:
-            from autotrainer.skills.data_fix.handler import DataFixHandler
-            self._fix_handler = DataFixHandler(llm_client=self.llm)
-        return self._fix_handler
+    def _load_skill(self) -> str:
+        if not self._skill_md:
+            skill_path = os.path.join(
+                os.path.dirname(__file__), "..", "skills", "data_inspect", "SKILL.md"
+            )
+            with open(skill_path, "r") as f:
+                self._skill_md = f.read()
+        return self._skill_md
 
     # ══════════════════════════════════════════════════════════
     # Main entry point
     # ══════════════════════════════════════════════════════════
 
     def run(self, data_paths: list[str]) -> list[DatasetResult]:
-        """Process a list of data paths. Returns results for all datasets."""
+        """Process a list of dataset paths."""
         results = []
         for path in data_paths:
             click.echo(f"\n{'═' * 65}")
-            click.echo(f"  Processing: {path}")
+            click.echo(f"  Dataset: {os.path.basename(path)}")
+            click.echo(f"  Path:    {path}")
             click.echo(f"{'═' * 65}")
             result = self._process_one(path)
             results.append(result)
             self._save_result(result)
-
         self._print_summary(results)
         return results
 
     def _process_one(self, source_path: str) -> DatasetResult:
-        """Full pipeline for a single data source."""
-        name = Path(source_path).stem
+        """Run the full ReAct pipeline for one dataset."""
+        name = Path(source_path).name
         ds_dir = os.path.join(self.work_dir, name)
         os.makedirs(ds_dir, exist_ok=True)
 
@@ -141,91 +131,61 @@ class DataAgent:
             started_at=datetime.now().isoformat(),
         )
 
-        # ── Step 1: Inspect ──────────────────────────────────
-        click.echo(f"\n  [1/7] Inspecting data...")
-        inspection = self.inspector.inspect(source_path)
-        summary = inspection.to_llm_summary()
-        click.echo(f"    Format: {inspection.format_hint}")
-        click.echo(f"    Rows (estimated): {inspection.estimated_rows}")
-        click.echo(f"    Schema fields: {list(inspection.schema.keys())}")
-        if inspection.issues:
-            for issue in inspection.issues:
-                click.echo(f"    [WARN] {issue}")
+        # ── Phase 1: ReAct exploration + script generation ────
+        click.echo(f"\n  [Phase 1] Exploring data and generating conversion script...")
 
-        # Update context data zone
-        self.context.set_data_profile({
-            "dataset": name,
-            "format": inspection.format_hint,
-            "rows": inspection.estimated_rows,
-            "schema": inspection.schema,
-            "sample_count": len(inspection.samples),
-        })
+        jsonl_path = os.path.join(ds_dir, f"raw_{name}.jsonl")
+        script, react_steps = asyncio.run(
+            self._react_loop(source_path, jsonl_path, ds_dir)
+        )
+        result.react_steps = react_steps
 
-        # ── Step 2: Generate conversion script ───────────────
-        click.echo(f"\n  [2/7] Generating conversion script...")
-        script = self._generate_script(summary, source_path, inspection)
         if not script:
             result.status = "failed"
-            result.errors.append("LLM script generation failed")
+            result.errors.append("Could not generate a conversion script")
             result.completed_at = datetime.now().isoformat()
             return result
 
-        result.format_identified = "auto-detected"
+        # Save the final script
         script_path = os.path.join(ds_dir, "convert_script.py")
         with open(script_path, "w") as f:
             f.write(script)
         result.script_path = script_path
-        click.echo(f"    Script saved: {script_path}")
 
-        # Syntax check
-        ok, syntax_err = self.sandbox.validate_script(script)
-        if not ok:
-            click.echo(f"    [WARN] Syntax error: {syntax_err}")
-            # Try to fix syntax immediately
-            script = asyncio.run(
-                self._get_fix_handler().fix_script(
-                    script, f"Syntax error:\n{syntax_err}",
-                    inspection.samples[:3], attempt=0
-                )
-            ).get("script", script)
-
-        # ── Step 3-5: Run → Validate → Fix loop ──────────────
-        jsonl_path = os.path.join(ds_dir, f"raw_{name}.jsonl")
-        script, sandbox_result = self._run_with_retry(
-            script=script,
-            source_path=source_path,
-            output_path=jsonl_path,
-            inspection=inspection,
+        # ── Phase 2: Execute + validate + fix loop ────────────
+        click.echo(f"\n  [Phase 2] Running conversion script...")
+        script, sandbox_result, attempts = self._run_with_retry(
+            script, source_path, jsonl_path
         )
-        result.attempts = MAX_RETRY  # actual count tracked inside
+        result.script_attempts = attempts
 
-        # Save final script
+        # Update final script
         with open(script_path, "w") as f:
             f.write(script)
 
         if not sandbox_result.success or sandbox_result.output_rows == 0:
             result.status = "failed"
-            result.errors.append("Script execution failed after retries")
+            result.errors.append(f"Script failed after {attempts} attempts")
             result.completed_at = datetime.now().isoformat()
-            click.echo(f"    [FAIL] Could not convert data. Script saved at: {script_path}")
-            click.echo(f"    Inspect and fix manually, then re-run with --script {script_path}")
+            click.echo(f"  [FAIL] Check script: {script_path}")
+            click.echo(f"  [FAIL] Error: {sandbox_result.error_summary[:300]}")
             return result
 
         result.raw_jsonl_path = jsonl_path
-        click.echo(f"    Converted {sandbox_result.output_rows} rows → {jsonl_path}")
+        click.echo(f"  Converted {sandbox_result.output_rows} rows → {jsonl_path}")
 
-        # ── Step 6: Clean ─────────────────────────────────────
-        click.echo(f"\n  [5/7] Cleaning (dedup, bad rows, normalize)...")
+        # ── Phase 3: Standard post-processing ─────────────────
         from autotrainer.managers.data_pipeline import DataPipeline
         dp = DataPipeline(cache_dir=self.work_dir)
 
+        click.echo(f"\n  [Phase 3] Cleaning (dedup, bad rows)...")
         cleaned_path = os.path.join(ds_dir, f"cleaned_{name}.jsonl")
         stats = dp.clean(jsonl_path, cleaned_path)
         result.clean_stats = stats
         result.cleaned_path = cleaned_path
         click.echo(
-            f"    {stats['input_lines']} in → "
-            f"dupes={stats['duplicates']}, bad={stats['json_errors']}, "
+            f"    {stats['input_lines']} → "
+            f"dupes={stats['duplicates']} bad={stats['json_errors']} "
             f"empty={stats['empty_content']} → {stats['output_lines']} out"
         )
 
@@ -235,29 +195,24 @@ class DataAgent:
             result.completed_at = datetime.now().isoformat()
             return result
 
-        # ── Step 7: Profile ────────────────────────────────────
-        click.echo(f"\n  [6/7] Profiling...")
+        click.echo(f"\n  [Phase 4] Profiling...")
         prof = dp.profile(cleaned_path)
         result.profile = prof
         tl = prof.get("text_lengths", {})
         click.echo(f"    {prof.get('num_samples', 0)} samples, {prof.get('size_mb', 0)}MB")
         if tl:
-            click.echo(f"    text: avg={tl.get('avg', 0)} p95={tl.get('p95', 0)} max={tl.get('max', 0)}")
+            click.echo(f"    text: avg={tl.get('avg', 0)} p95={tl.get('p95', 0)}")
         if prof.get("sample_preview"):
             preview = json.dumps(prof["sample_preview"][0], ensure_ascii=False)
-            click.echo(f"    preview: {preview[:250]}")
+            click.echo(f"    preview: {preview[:200]}")
 
-        # Update context with data profile
-        self.context.set_data_profile(prof)
-
-        # ── Step 8: Split ──────────────────────────────────────
-        click.echo(f"\n  [7/7] Splitting 90/5/5...")
+        click.echo(f"\n  [Phase 5] Splitting 90/5/5...")
         split_r = dp.split(cleaned_path)
         result.split = split_r
         click.echo(
             f"    train={split_r['train']['count']} → {split_r['train']['path']}\n"
-            f"    val  ={split_r['val']['count']}   → {split_r['val']['path']}\n"
-            f"    test ={split_r['test']['count']}  → {split_r['test']['path']}"
+            f"    val  ={split_r['val']['count']}\n"
+            f"    test ={split_r['test']['count']}"
         )
 
         result.status = "completed"
@@ -265,42 +220,291 @@ class DataAgent:
         return result
 
     # ══════════════════════════════════════════════════════════
-    # Script generation
+    # ReAct loop — think → act → observe
     # ══════════════════════════════════════════════════════════
 
-    def _generate_script(
+    async def _react_loop(
         self,
-        inspection_summary: str,
         source_path: str,
-        inspection: InspectionResult,
-    ) -> str:
-        """Call data-inspect skill to get a conversion script."""
-        handler = self._get_inspect_handler()
+        output_path: str,
+        work_dir: str,
+    ) -> tuple[str, int]:
+        """Run the ReAct exploration loop.
 
+        Returns: (final_script, num_steps)
+        """
         if not self.llm:
-            # No LLM: return a passthrough script for already-erniekit data
-            return self._fallback_passthrough_script()
+            # No LLM — use passthrough script for already-JSONL data
+            click.echo("  No LLM configured, using passthrough script")
+            return self._passthrough_script(), 0
+
+        system_prompt = self._load_skill()
+
+        # Conversation history for the ReAct loop
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset path: {source_path}\n"
+                    f"Output should go to: {output_path}\n\n"
+                    f"Explore this dataset and write a Python conversion script "
+                    f"to convert it to erniekit JSONL format. "
+                    f"Start by exploring the directory structure."
+                ),
+            }
+        ]
+
+        for step in range(1, MAX_REACT_STEPS + 1):
+            click.echo(f"    Step {step}/{MAX_REACT_STEPS}...", nl=False)
+
+            # Ask LLM for next action
+            try:
+                response_text = await self.llm.complete_messages(
+                    messages=[{"role": "system", "content": system_prompt}] + messages,
+                    max_tokens=4096,
+                    temperature=0.0,
+                )
+            except Exception as e:
+                click.echo(f" LLM error: {e}")
+                return "", step
+
+            # Parse the action
+            try:
+                action = self._parse_action(response_text)
+            except Exception as e:
+                click.echo(f" parse error: {e}")
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({
+                    "role": "user",
+                    "content": f"Parse error: {e}. Please respond with valid JSON.",
+                })
+                continue
+
+            # Append to history
+            messages.append({"role": "assistant", "content": response_text})
+
+            act_type = action.get("action", "")
+            thought = action.get("thought", "")
+
+            if thought:
+                click.echo(f" {thought[:80]}")
+
+            # ── final_script ──────────────────────────────────
+            if act_type == "final_script":
+                script = action.get("script", "")
+                if script:
+                    click.echo(f"    → Script ready ({len(script)} chars)")
+                    return script, step
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": "The 'script' field was empty. Please provide the complete Python script.",
+                    })
+                    continue
+
+            # ── shell ─────────────────────────────────────────
+            elif act_type == "shell":
+                cmd = action.get("command", "")
+                click.echo(f" $ {cmd[:60]}")
+                output = self._run_shell(cmd)
+                truncated = output[:MAX_CMD_OUTPUT]
+                if len(output) > MAX_CMD_OUTPUT:
+                    truncated += f"\n...[truncated, {len(output)} total chars]"
+                messages.append({
+                    "role": "user",
+                    "content": f"Shell output:\n```\n{truncated}\n```",
+                })
+
+            # ── python ────────────────────────────────────────
+            elif act_type == "python":
+                code = action.get("code", "")
+                click.echo(f" python snippet")
+                output = self._run_python_snippet(code, source_path)
+                truncated = output[:MAX_CMD_OUTPUT]
+                if len(output) > MAX_CMD_OUTPUT:
+                    truncated += f"\n...[truncated, {len(output)} total chars]"
+                messages.append({
+                    "role": "user",
+                    "content": f"Python output:\n```\n{truncated}\n```",
+                })
+
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Unknown action '{act_type}'. "
+                        f"Use one of: shell, python, final_script."
+                    ),
+                })
+
+        click.echo(f"    Reached max steps ({MAX_REACT_STEPS})")
+        return "", MAX_REACT_STEPS
+
+    def _parse_action(self, text: str) -> dict:
+        """Parse LLM response as JSON action."""
+        text = text.strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+        return json.loads(text)
+
+    def _run_shell(self, cmd: str) -> str:
+        """Run a shell command safely and return output."""
+        # Block destructive commands
+        blocked = ["rm -rf", "rm -f", "mkfs", "dd if=", "> /dev/", "shutdown", "reboot"]
+        for b in blocked:
+            if b in cmd:
+                return f"[BLOCKED] Command contains '{b}' which is not allowed"
 
         try:
-            result = asyncio.run(handler.generate_script(inspection_summary, source_path))
-            script = result.get("script", "")
-            if script:
-                fmt = result.get("format_identified", "")
-                explanation = result.get("explanation", "")
-                click.echo(f"    Format identified: {fmt}")
-                click.echo(f"    Plan: {explanation[:150]}")
-            return script
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=self.work_dir,
+            )
+            out = result.stdout
+            if result.stderr:
+                out += f"\n[stderr]: {result.stderr[:500]}"
+            return out or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT] Command took too long (>30s)"
         except Exception as e:
-            click.echo(f"    [WARN] LLM script generation error: {e}")
-            return self._fallback_passthrough_script()
+            return f"[ERROR] {e}"
 
-    def _fallback_passthrough_script(self) -> str:
-        """Passthrough script for data already in erniekit/messages format."""
-        return '''
-import os, json, shutil
+    def _run_python_snippet(self, code: str, source_path: str) -> str:
+        """Run a Python code snippet and return stdout."""
+        # Inject INPUT_PATH for convenience
+        preamble = f"import os\nos.environ['INPUT_PATH'] = {repr(source_path)}\n"
+        full_code = preamble + code
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(full_code)
+            tmp = f.name
+
+        try:
+            result = subprocess.run(
+                ["python", tmp],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            out = result.stdout
+            if result.stderr:
+                out += f"\n[stderr]: {result.stderr[:800]}"
+            return out or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT] Python snippet took too long (>60s)"
+        except Exception as e:
+            return f"[ERROR] {e}"
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    # ══════════════════════════════════════════════════════════
+    # Script execution + fix loop
+    # ══════════════════════════════════════════════════════════
+
+    def _run_with_retry(
+        self,
+        script: str,
+        source_path: str,
+        output_path: str,
+    ) -> tuple[str, SandboxResult, int]:
+        """Execute script, validate, fix and retry on failure."""
+        last_result = SandboxResult()
+
+        for attempt in range(1, MAX_RETRY_SCRIPT + 1):
+            click.echo(f"  Attempt {attempt}/{MAX_RETRY_SCRIPT}...", nl=False)
+
+            ok, syntax_err = self.sandbox.validate_script(script)
+            if not ok:
+                click.echo(f" syntax error")
+                if self.llm and attempt < MAX_RETRY_SCRIPT:
+                    script = self._fix_script_sync(script, f"Syntax error:\n{syntax_err}")
+                    continue
+                break
+
+            result = self.sandbox.run(script, source_path, output_path)
+            last_result = result
+
+            if result.success and result.output_rows > 0:
+                validation = self.validator.validate_file(output_path)
+                if validation.valid:
+                    click.echo(f" OK ({result.output_rows} rows, {result.elapsed_seconds:.1f}s)")
+                    return script, result, attempt
+                error = "Output format invalid: " + "; ".join(validation.errors[:3])
+                click.echo(f" format invalid")
+            elif result.output_rows == 0 and result.success:
+                error = "Script ran but produced 0 rows"
+                click.echo(f" 0 rows")
+            else:
+                error = result.error_summary
+                click.echo(f" failed")
+
+            if self.llm and attempt < MAX_RETRY_SCRIPT:
+                script = self._fix_script_sync(script, error)
+            else:
+                break
+
+        return script, last_result, MAX_RETRY_SCRIPT
+
+    def _fix_script_sync(self, script: str, error: str) -> str:
+        """Synchronous wrapper for LLM script fix."""
+        if not self.llm:
+            return script
+
+        click.echo(f"  Asking LLM to fix...")
+
+        fix_skill_path = os.path.join(
+            os.path.dirname(__file__), "..", "skills", "data_fix", "SKILL.md"
+        )
+        try:
+            with open(fix_skill_path) as f:
+                fix_system = f.read()
+        except FileNotFoundError:
+            fix_system = "Fix the Python script based on the error."
+
+        user_msg = f"Error:\n{error}\n\nScript:\n```python\n{script[:6000]}\n```\n\nFix it."
+
+        try:
+            result = asyncio.run(
+                self.llm.complete_json(system=fix_system, user=user_msg, max_tokens=4096)
+            )
+            new_script = result.get("script", "")
+            if new_script and new_script != script:
+                click.echo(f"    fix: {result.get('fix_applied', '')[:80]}")
+                return new_script
+        except Exception as e:
+            click.echo(f"    fix failed: {e}")
+
+        return script
+
+    def _passthrough_script(self) -> str:
+        """Passthrough for already-erniekit data or no-LLM fallback."""
+        return '''import os, json
 
 INPUT_PATH = os.environ["INPUT_PATH"]
 OUTPUT_PATH = os.environ["OUTPUT_PATH"]
+
+import os as _os
+# If INPUT_PATH is a directory, find the first JSONL/JSON file
+if _os.path.isdir(INPUT_PATH):
+    for root, dirs, files in _os.walk(INPUT_PATH):
+        for fn in files:
+            ext = fn.lower().rsplit(".", 1)[-1]
+            if ext in ("jsonl", "json"):
+                INPUT_PATH = _os.path.join(root, fn)
+                break
+        if not _os.path.isdir(INPUT_PATH):
+            break
 
 count = 0
 with open(INPUT_PATH, "r", errors="replace") as fin, open(OUTPUT_PATH, "w") as fout:
@@ -320,108 +524,36 @@ print(f"Converted: {count} samples")
 '''
 
     # ══════════════════════════════════════════════════════════
-    # Run → Validate → Fix loop
-    # ══════════════════════════════════════════════════════════
-
-    def _run_with_retry(
-        self,
-        script: str,
-        source_path: str,
-        output_path: str,
-        inspection: InspectionResult,
-    ) -> tuple[str, SandboxResult]:
-        """Execute script, validate output, fix and retry on failure."""
-        handler = self._get_fix_handler()
-        last_result = SandboxResult()
-
-        for attempt in range(1, MAX_RETRY + 1):
-            click.echo(f"\n  [3/7] Running script (attempt {attempt}/{MAX_RETRY})...")
-            t0 = time.time()
-            result = self.sandbox.run(script, source_path, output_path)
-            elapsed = time.time() - t0
-
-            if result.success and result.output_rows > 0:
-                # Validate format
-                click.echo(f"    Ran in {elapsed:.1f}s → {result.output_rows} rows")
-                validation = self.validator.validate_file(output_path)
-                if validation.valid:
-                    click.echo(f"    Output format: {validation.format_detected} ✓")
-                    return script, result
-                else:
-                    error = f"Output validation failed:\n" + "\n".join(validation.errors[:5])
-                    click.echo(f"    Format validation failed: {validation.errors[:3]}")
-            elif result.output_rows == 0 and result.success:
-                error = "Script ran successfully but produced 0 output rows"
-                click.echo(f"    [WARN] 0 rows output")
-            else:
-                error = result.error_summary
-                click.echo(f"    [FAIL] {error[:200]}")
-
-            last_result = result
-
-            if attempt < MAX_RETRY:
-                click.echo(f"  [4/7] Asking LLM to fix script...")
-                if not self.llm:
-                    click.echo("    No LLM configured, cannot auto-fix")
-                    break
-
-                # Trim script for context (avoid huge scripts in context)
-                script_for_context = script
-                if len(script) > MAX_SCRIPT_TOKENS * 4:
-                    script_for_context = script[:MAX_SCRIPT_TOKENS * 4] + "\n# ... (truncated)"
-
-                try:
-                    fix_result = asyncio.run(
-                        handler.fix_script(
-                            original_script=script_for_context,
-                            error_summary=error,
-                            data_samples=inspection.samples[:5],
-                            attempt=attempt,
-                        )
-                    )
-                    new_script = fix_result.get("script", "")
-                    if new_script and new_script != script:
-                        click.echo(f"    Fix: {fix_result.get('fix_applied', '')[:100]}")
-                        script = new_script
-                    else:
-                        click.echo("    LLM returned same script, stopping retries")
-                        break
-                except Exception as e:
-                    click.echo(f"    Fix failed: {e}")
-                    break
-
-        return script, last_result
-
-    # ══════════════════════════════════════════════════════════
-    # Persistence
+    # Persistence and summary
     # ══════════════════════════════════════════════════════════
 
     def _save_result(self, result: DatasetResult):
-        """Append result to the data processing index."""
         index_path = os.path.join(self.work_dir, "data_index.json")
         index = safe_read_json(index_path) or {"datasets": []}
-
-        # Update or append
-        existing_ids = {d["source_path"] for d in index.get("datasets", [])}
-        if result.source_path in existing_ids:
+        existing = {d["source_path"] for d in index.get("datasets", [])}
+        if result.source_path in existing:
             for i, d in enumerate(index["datasets"]):
                 if d["source_path"] == result.source_path:
                     index["datasets"][i] = result.to_record()
                     break
         else:
             index["datasets"].append(result.to_record())
-
         atomic_write_json(index_path, index)
 
     def _print_summary(self, results: list[DatasetResult]):
         click.echo(f"\n{'═' * 65}")
-        click.echo(f"  Data Processing Summary")
+        click.echo("  Summary")
         click.echo(f"{'═' * 65}")
         completed = [r for r in results if r.status == "completed"]
         failed = [r for r in results if r.status == "failed"]
         click.echo(f"  Completed: {len(completed)} / {len(results)}")
         for r in completed:
-            samples = r.profile.get("num_samples", 0)
-            click.echo(f"    ✓ {r.dataset_name}: {samples} samples → {r.split.get('train', {}).get('path', '')}")
+            n = r.profile.get("num_samples", 0)
+            train_path = r.split.get("train", {}).get("path", "")
+            click.echo(f"    ✓ {r.dataset_name}: {n} samples → {train_path}")
         for r in failed:
             click.echo(f"    ✗ {r.dataset_name}: {r.errors}")
+        if completed:
+            click.echo(f"\n  Ready for training:")
+            for r in completed:
+                click.echo(f"    train: {r.split.get('train', {}).get('path', '')}")
