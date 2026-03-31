@@ -48,11 +48,12 @@ def run(task: str, gpus: str | None, resume: bool, no_tui: bool, config_override
 @click.option("--data-path", type=str, default=None, help="Path to existing data (for fixed mode)")
 @click.option("--output-dir", type=str, default=None, help="Output directory for processed data")
 @click.option("--query", type=str, default=None, help="Custom search query (for discover/expand mode)")
-def data(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None):
-    """Manage datasets in 3 modes."""
+@click.option("--full", "full_pipeline", is_flag=True, default=False, help="Run full pipeline: search → select → download → clean → convert → profile → split")
+def data(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None, full_pipeline: bool):
+    """Manage datasets. Use --full for the complete search-download-convert pipeline."""
     from autotrainer.cli.data_cmd import data_command
 
-    data_command(mode=mode, task=task, data_path=data_path, output_dir=output_dir, query=query)
+    data_command(mode=mode, task=task, data_path=data_path, output_dir=output_dir, query=query, full_pipeline=full_pipeline)
 
 
 @cli.command()
