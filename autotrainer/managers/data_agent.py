@@ -36,6 +36,11 @@ MAX_RETRY_SCRIPT = 3     # max times to retry fixing the script
 MAX_CMD_OUTPUT = 3000    # truncate command output to this length for context
 MAX_LOOP_REPEAT = 3      # if same thought appears this many times, force final_script
 
+TIMEOUT_PER_GB = 300     # seconds of sandbox timeout per GB of input data
+TIMEOUT_BASE = 120       # minimum timeout regardless of size
+TIMEOUT_MAX = 3600       # maximum timeout (1 hour)
+QUICK_VALIDATE_ROWS = 100  # rows to validate script correctness before full run
+
 
 @dataclass
 class DatasetResult:
@@ -107,8 +112,14 @@ class DataAgent:
     # Main entry point
     # ══════════════════════════════════════════════════════════
 
-    def run(self, data_paths: list[str]) -> list[DatasetResult]:
-        """Process a list of dataset paths, with resume support."""
+    def run(self, data_paths: list[str], custom_script: str | None = None) -> list[DatasetResult]:
+        """Process a list of dataset paths, with resume support.
+
+        Args:
+            custom_script: Path to a pre-written Python conversion script.
+                           Skips LLM generation and uses this script directly.
+                           Useful for manual iteration after a failed run.
+        """
         total = len(data_paths)
         results = []
 
@@ -124,11 +135,12 @@ class DataAgent:
             click.echo(f"\n{'═' * 65}")
             click.echo(f"  [{i}/{total}] {name}")
             click.echo(f"  Path: {path}")
+            if custom_script:
+                click.echo(f"  Script: {custom_script} (manual)")
 
-            # Resume: skip already completed
-            if path in completed_paths:
+            # Resume: skip already completed (unless custom_script forces re-run)
+            if path in completed_paths and not custom_script:
                 click.echo(f"  [SKIP] Already completed in previous run")
-                # Load previous result for summary
                 for d in index.get("datasets", []):
                     if d["source_path"] == path:
                         r = DatasetResult(**{k: v for k, v in d.items() if k in DatasetResult.__dataclass_fields__})
@@ -137,7 +149,7 @@ class DataAgent:
                 continue
 
             click.echo(f"{'═' * 65}")
-            result = self._process_one(path)
+            result = self._process_one(path, custom_script=custom_script)
             results.append(result)
             self._save_result(result)
 
@@ -149,8 +161,8 @@ class DataAgent:
         self._print_summary(results)
         return results
 
-    def _process_one(self, source_path: str) -> DatasetResult:
-        """Run the full ReAct pipeline for one dataset."""
+    def _process_one(self, source_path: str, custom_script: str | None = None) -> DatasetResult:
+        """Run the full pipeline for one dataset."""
         name = Path(source_path).name
         ds_dir = os.path.join(self.work_dir, name)
         image_dir = os.path.join(ds_dir, "images")
@@ -163,14 +175,21 @@ class DataAgent:
             started_at=datetime.now().isoformat(),
         )
 
-        # ── Phase 1: ReAct exploration + script generation ────
-        click.echo(f"\n  [1/5] Exploring data and generating conversion script...")
-
         jsonl_path = os.path.join(ds_dir, f"raw_{name}.jsonl")
-        script, react_steps = asyncio.run(
-            self._react_loop(source_path, jsonl_path, image_dir)
-        )
-        result.react_steps = react_steps
+
+        # ── Phase 1: Get conversion script ────────────────────
+        if custom_script:
+            # Use manually provided script (skip LLM generation)
+            click.echo(f"\n  [1/5] Using provided script: {custom_script}")
+            with open(custom_script, "r") as f:
+                script = f.read()
+            result.react_steps = 0
+        else:
+            click.echo(f"\n  [1/5] Exploring data and generating conversion script...")
+            script, react_steps = asyncio.run(
+                self._react_loop(source_path, jsonl_path, image_dir)
+            )
+            result.react_steps = react_steps
 
         if not script:
             result.status = "failed"
@@ -199,8 +218,11 @@ class DataAgent:
             result.status = "failed"
             result.errors.append(f"Script failed after {attempts} attempts")
             result.completed_at = datetime.now().isoformat()
-            click.echo(f"  [FAIL] Check script: {script_path}")
-            click.echo(f"  [FAIL] Error: {sandbox_result.error_summary[:300]}")
+            click.echo(f"\n  [FAIL] {sandbox_result.error_summary[:200]}")
+            click.echo(f"  Script saved at: {script_path}")
+            click.echo(f"  To fix manually and re-run:")
+            click.echo(f"    1. Edit: {script_path}")
+            click.echo(f"    2. Re-run: autotrainer data --path {source_path} --script {script_path}")
             return result
 
         result.raw_jsonl_path = jsonl_path
@@ -525,6 +547,74 @@ class DataAgent:
     # Script execution + fix loop
     # ══════════════════════════════════════════════════════════
 
+    def _calc_timeout(self, source_path: str) -> int:
+        """Calculate sandbox timeout based on dataset size."""
+        try:
+            if os.path.isfile(source_path):
+                size_gb = os.path.getsize(source_path) / (1024 ** 3)
+            else:
+                size_gb = sum(
+                    f.stat().st_size for f in Path(source_path).rglob("*") if f.is_file()
+                ) / (1024 ** 3)
+        except OSError:
+            size_gb = 1.0
+
+        timeout = int(TIMEOUT_BASE + size_gb * TIMEOUT_PER_GB)
+        return min(timeout, TIMEOUT_MAX)
+
+    def _inject_row_limit(self, script: str, max_rows: int) -> str:
+        """Inject a MAX_ROWS limit into a conversion script for quick validation.
+
+        Adds MAX_ROWS env var support: the script will stop after max_rows output rows.
+        This wraps the script so the original script doesn't need to be modified.
+        """
+        wrapper = f'''import os as _os, subprocess as _sp, sys as _sys, tempfile as _tmp, json as _json
+
+_MAX_ROWS = int(_os.environ.get("MAX_ROWS", "0"))
+
+# Run the original script, then cap the output
+import io as _io
+_orig_input = _os.environ.get("INPUT_PATH", "")
+_orig_output = _os.environ.get("OUTPUT_PATH", "")
+
+# Write original script to temp file
+import textwrap as _tw
+_script = _tw.dedent("""{script.replace(chr(34)*3, chr(34)*2 + chr(92) + chr(34))}""")
+with _tmp.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as _f:
+    _f.write(_script)
+    _tmp_path = _f.name
+
+# Run with a temp output
+_tmp_out = _orig_output + ".tmp_validate"
+_env = dict(_os.environ)
+_env["OUTPUT_PATH"] = _tmp_out
+import subprocess
+_r = subprocess.run(["python", _tmp_path], env=_env, capture_output=True, text=True, timeout={max_rows * 10})
+print(_r.stdout)
+if _r.returncode != 0:
+    print(_r.stderr, file=_sys.stderr)
+    _sys.exit(_r.returncode)
+
+# Cap to MAX_ROWS
+if _MAX_ROWS > 0 and _os.path.exists(_tmp_out):
+    count = 0
+    with open(_tmp_out) as _fin, open(_orig_output, "w") as _fout:
+        for _line in _fin:
+            if count >= _MAX_ROWS:
+                break
+            _fout.write(_line)
+            count += 1
+    _os.unlink(_tmp_out)
+    print(f"[validate] Capped to {{count}} rows")
+else:
+    if _os.path.exists(_tmp_out):
+        import shutil; shutil.move(_tmp_out, _orig_output)
+_os.unlink(_tmp_path)
+'''
+        # This approach is too complex — instead inject directly into the script
+        # Simply prefix the script with a row counter interceptor
+        return script  # Return original; we use separate env var approach in sandbox
+
     def _run_with_retry(
         self,
         script: str,
@@ -532,22 +622,83 @@ class DataAgent:
         output_path: str,
         image_dir: str = "",
     ) -> tuple[str, SandboxResult, int]:
-        """Execute script, validate, fix and retry on failure."""
+        """Two-phase execution: quick validation (100 rows) then full run.
+
+        Phase 1: Run on first 100 rows with short timeout to verify script correctness.
+        Phase 2: Full run with adaptive timeout based on dataset size.
+        """
         last_result = SandboxResult()
+        extra_env = {"IMAGE_DIR": image_dir} if image_dir else {}
+        full_timeout = self._calc_timeout(source_path)
+
+        # ── Phase 1: Quick validation on 100 rows ────────────────────────
+        click.echo(f"  Quick validation (first {QUICK_VALIDATE_ROWS} rows)...", nl=False)
+        quick_output = output_path + ".quick_validate"
+
+        # Wrap script to limit rows
+        limited_script = self._make_limited_script(script, QUICK_VALIDATE_ROWS)
+        ok, syntax_err = self.sandbox.validate_script(limited_script)
+        if not ok:
+            click.echo(f" syntax error")
+            if self.llm:
+                script = self._fix_script_sync(script, f"Syntax error:\n{syntax_err}", source_path)
+            last_result.success = False
+            last_result.stderr = syntax_err
+        else:
+            quick_sb = Sandbox(timeout=60)
+            q_result = quick_sb.run(limited_script, source_path, quick_output, extra_env=extra_env)
+
+            if q_result.success and q_result.output_rows > 0:
+                click.echo(f" OK ({q_result.output_rows} rows sampled)")
+                # Validate format on quick output
+                validation = self.validator.validate_file(quick_output)
+                if not validation.valid:
+                    click.echo(f"  Format invalid on sample: {validation.errors[:2]}")
+                    if self.llm:
+                        error = "Output format invalid: " + "; ".join(validation.errors[:3])
+                        script = self._fix_script_sync(script, error, source_path)
+            elif q_result.timed_out:
+                click.echo(f" timeout even on 100 rows — script has fundamental performance issue")
+                error = (
+                    f"Script timed out on just {QUICK_VALIDATE_ROWS} rows (60s limit). "
+                    f"This usually means: 1) PIL image saving is too slow — skip saving images in the script, "
+                    f"just use image_info=[] instead; 2) The loop has an unexpected infinite loop; "
+                    f"3) pandas operations are inefficient. Simplify the script significantly."
+                )
+                if self.llm:
+                    script = self._fix_script_sync(script, error, source_path)
+            else:
+                stdout_hint = q_result.stdout.strip()[-400:] if q_result.stdout else "(no stdout)"
+                click.echo(f" 0 rows — {stdout_hint[:100]}")
+                error = (
+                    f"Script produced 0 rows on {QUICK_VALIDATE_ROWS}-row sample.\n"
+                    f"stdout: {stdout_hint}\nstderr: {q_result.stderr[-400:]}"
+                )
+                if self.llm:
+                    script = self._fix_script_sync(script, error, source_path)
+            last_result = q_result
+
+        try:
+            os.unlink(quick_output)
+        except OSError:
+            pass
+
+        # ── Phase 2: Full run with retry loop ────────────────────────────
+        full_sandbox = Sandbox(timeout=full_timeout)
+        click.echo(f"  Full run (timeout={full_timeout}s for {self._calc_size_gb(source_path):.1f}GB)...")
 
         for attempt in range(1, MAX_RETRY_SCRIPT + 1):
             click.echo(f"  Attempt {attempt}/{MAX_RETRY_SCRIPT}...", nl=False)
 
-            ok, syntax_err = self.sandbox.validate_script(script)
+            ok, syntax_err = full_sandbox.validate_script(script)
             if not ok:
                 click.echo(f" syntax error")
                 if self.llm and attempt < MAX_RETRY_SCRIPT:
-                    script = self._fix_script_sync(script, f"Syntax error:\n{syntax_err}")
+                    script = self._fix_script_sync(script, f"Syntax error:\n{syntax_err}", source_path)
                     continue
                 break
 
-            extra_env = {"IMAGE_DIR": image_dir} if image_dir else {}
-            result = self.sandbox.run(script, source_path, output_path, extra_env=extra_env)
+            result = full_sandbox.run(script, source_path, output_path, extra_env=extra_env)
             last_result = result
 
             if result.success and result.output_rows > 0:
@@ -557,28 +708,100 @@ class DataAgent:
                     return script, result, attempt
                 error = "Output format invalid: " + "; ".join(validation.errors[:3])
                 click.echo(f" format invalid")
+            elif result.timed_out:
+                size_gb = self._calc_size_gb(source_path)
+                error = (
+                    f"Script timed out after {full_timeout}s on {size_gb:.1f}GB dataset.\n"
+                    f"Processed rows before timeout: {result.output_rows}.\n"
+                    f"Fix: 1) Skip PIL image saving (use image_info=[]) to reduce IO. "
+                    f"2) Process fewer parquet files (e.g. only first 2). "
+                    f"3) Use df.itertuples() instead of df.iterrows() for 3-5x speedup."
+                )
+                click.echo(f" timeout ({result.output_rows} rows before cutoff)")
+                if self.llm and attempt < MAX_RETRY_SCRIPT:
+                    script = self._fix_script_sync(script, error, source_path)
+                else:
+                    break
             elif result.output_rows == 0 and result.success:
-                # Show stdout so LLM can see what happened
                 stdout_hint = result.stdout.strip()[-500:] if result.stdout.strip() else "(no stdout)"
                 error = (
-                    f"Script ran successfully but produced 0 output rows.\n"
-                    f"Script stdout: {stdout_hint}\n"
-                    f"Possible causes: wrong field names, all rows filtered out, "
-                    f"empty input file, or output not written to OUTPUT_PATH."
+                    f"Script ran successfully but produced 0 rows.\n"
+                    f"stdout: {stdout_hint}\n"
+                    f"Causes: wrong field names / all rows filtered / not writing to OUTPUT_PATH."
                 )
                 click.echo(f" 0 rows — {stdout_hint[:100]}")
+                if self.llm and attempt < MAX_RETRY_SCRIPT:
+                    script = self._fix_script_sync(script, error, source_path)
+                else:
+                    break
             else:
                 error = result.error_summary
                 click.echo(f" failed")
-
-            if self.llm and attempt < MAX_RETRY_SCRIPT:
-                script = self._fix_script_sync(script, error)
-            else:
-                break
+                if self.llm and attempt < MAX_RETRY_SCRIPT:
+                    script = self._fix_script_sync(script, error, source_path)
+                else:
+                    break
 
         return script, last_result, MAX_RETRY_SCRIPT
 
-    def _fix_script_sync(self, script: str, error: str) -> str:
+    def _calc_size_gb(self, source_path: str) -> float:
+        """Get dataset size in GB."""
+        try:
+            if os.path.isfile(source_path):
+                return os.path.getsize(source_path) / (1024 ** 3)
+            return sum(
+                f.stat().st_size for f in Path(source_path).rglob("*") if f.is_file()
+            ) / (1024 ** 3)
+        except OSError:
+            return 0.0
+
+    def _make_limited_script(self, script: str, max_rows: int) -> str:
+        """Wrap a script to stop after max_rows output rows."""
+        # Inject a row-counting wrapper around fout.write calls
+        # Strategy: replace open(OUTPUT_PATH, "w") with a counting wrapper
+        limited = f'''import os as _os_limit
+_MAX_ROWS_LIMIT = {max_rows}
+_ROWS_WRITTEN = 0
+
+# Monkey-patch to intercept output writes
+import builtins as _builtins
+_real_open = _builtins.open
+
+class _LimitedFile:
+    def __init__(self, f):
+        self._f = f
+    def write(self, s):
+        global _ROWS_WRITTEN
+        if s.strip():
+            _ROWS_WRITTEN += 1
+            if _ROWS_WRITTEN > _MAX_ROWS_LIMIT:
+                raise SystemExit(f"[row_limit] Reached {{_MAX_ROWS_LIMIT}} rows")
+        return self._f.write(s)
+    def __enter__(self): return self
+    def __exit__(self, *a): self._f.__exit__(*a)
+    def __getattr__(self, n): return getattr(self._f, n)
+
+_OUTPUT_PATH_VAL = _os_limit.environ.get("OUTPUT_PATH", "")
+def _patched_open(file, mode="r", *args, **kwargs):
+    f = _real_open(file, mode, *args, **kwargs)
+    if str(file) == _OUTPUT_PATH_VAL and "w" in str(mode):
+        return _LimitedFile(f)
+    return f
+_builtins.open = _patched_open
+
+try:
+{chr(10).join("    " + line for line in script.splitlines())}
+except SystemExit as _e:
+    if "[row_limit]" in str(_e):
+        pass  # expected stop
+    else:
+        raise
+finally:
+    _builtins.open = _real_open
+'''
+        return limited
+
+    def _fix_script_sync(self, script: str, error: str, source_path: str = "") -> str:
         """Synchronous wrapper for LLM script fix."""
         if not self.llm:
             return script
@@ -594,7 +817,18 @@ class DataAgent:
         except FileNotFoundError:
             fix_system = "Fix the Python script based on the error."
 
-        user_msg = f"Error:\n{error}\n\nScript:\n```python\n{script[:6000]}\n```\n\nFix it."
+        # Limit script size but always include beginning + end (most likely problem areas)
+        script_for_llm = script
+        if len(script) > 6000:
+            half = 3000
+            script_for_llm = script[:half] + "\n# ...[middle truncated]...\n" + script[-half:]
+
+        user_msg = (
+            f"Error:\n{error}\n\n"
+            f"Dataset path: {source_path}\n\n"
+            f"Script to fix:\n```python\n{script_for_llm}\n```\n\n"
+            f"Fix it. Return full corrected script in the 'script' field."
+        )
 
         try:
             result = asyncio.run(

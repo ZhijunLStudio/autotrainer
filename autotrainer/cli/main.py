@@ -44,16 +44,19 @@ def run(task: str, gpus: str | None, resume: bool, no_tui: bool, config_override
 
 @cli.command()
 @click.option("--path", "paths", multiple=True, required=True, help="Data file or directory (can repeat)")
-@click.option("--output-dir", type=str, default=None, help="Output directory for processed data")
+@click.option("--output-dir", type=str, default=None, help="Output directory (default: ./autotrainer_output/)")
 @click.option("--profile-only", is_flag=True, default=False, help="Only profile existing JSONL (no conversion)")
 @click.option("--split-only", is_flag=True, default=False, help="Only split existing JSONL into train/val/test")
-def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, split_only: bool):
+@click.option("--script", "custom_script", type=click.Path(exists=True), default=None,
+              help="Use a pre-written conversion script instead of generating one (for manual fix iteration)")
+def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, split_only: bool, custom_script: str | None):
     """Process training data with LLM-driven format conversion.
 
     \b
     Accepts any format: JSONL, JSON, CSV, TSV, Parquet, XML, ZIP, directories.
     The LLM inspects your data samples and writes a conversion script
     to transform it into erniekit JSONL format automatically.
+    Two-phase execution: quick 100-row validation, then full run with auto-scaled timeout.
 
     \b
     Examples:
@@ -61,9 +64,12 @@ def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, spl
       autotrainer data --path /data/a.parquet --path /data/b.csv
       autotrainer data --path /data/processed.jsonl --profile-only
       autotrainer data --path /data/cleaned.jsonl --split-only
+      # After a failure, edit the saved script and re-run:
+      autotrainer data --path /data/dataset/ --script ./autotrainer_output/dataset/convert_script.py
     """
     from autotrainer.cli.data_cmd import data_command
-    data_command(paths=list(paths), output_dir=output_dir, profile_only=profile_only, split_only=split_only)
+    data_command(paths=list(paths), output_dir=output_dir, profile_only=profile_only,
+                 split_only=split_only, custom_script=custom_script)
 
 
 @cli.command()

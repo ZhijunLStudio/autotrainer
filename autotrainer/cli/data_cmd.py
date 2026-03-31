@@ -24,6 +24,7 @@ def data_command(
     output_dir: str | None,
     profile_only: bool = False,
     split_only: bool = False,
+    custom_script: str | None = None,
 ):
     """Execute the data agent pipeline."""
     from autotrainer.config import AutoTrainerConfig
@@ -91,7 +92,7 @@ def data_command(
         context_store=context,
     )
 
-    agent.run(valid_paths)
+    agent.run(valid_paths, custom_script=custom_script)
 
 
 def _expand_path(path: str) -> list[str]:
