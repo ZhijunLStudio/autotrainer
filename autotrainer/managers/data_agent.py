@@ -90,6 +90,7 @@ class DataAgent:
         self.sandbox = Sandbox(timeout=sandbox_timeout)
         self.validator = DatasetValidator()
         self._skill_md: str | None = None
+        self._user_cwd = os.getcwd()    # capture cwd at creation for shell commands
         os.makedirs(work_dir, exist_ok=True)
 
     def _load_skill(self) -> str:
@@ -234,22 +235,31 @@ class DataAgent:
         Returns: (final_script, num_steps)
         """
         if not self.llm:
-            # No LLM — use passthrough script for already-JSONL data
             click.echo("  No LLM configured, using passthrough script")
             return self._passthrough_script(), 0
 
         system_prompt = self._load_skill()
 
-        # Conversation history for the ReAct loop
+        # ── Pre-explore: give LLM the directory tree upfront ──────────────
+        # This avoids wasting steps on "where is the data?" exploration.
+        click.echo("    Pre-exploring directory structure...")
+        pre_context = self._pre_explore(source_path)
+
+        # Seed the conversation with real file information
         messages = [
             {
                 "role": "user",
                 "content": (
-                    f"Dataset path: {source_path}\n"
-                    f"Output should go to: {output_path}\n\n"
-                    f"Explore this dataset and write a Python conversion script "
-                    f"to convert it to erniekit JSONL format. "
-                    f"Start by exploring the directory structure."
+                    f"Dataset absolute path: {source_path}\n"
+                    f"Output JSONL path: {output_path}\n\n"
+                    f"=== Directory structure (pre-explored) ===\n"
+                    f"{pre_context}\n"
+                    f"===========================================\n\n"
+                    f"Based on the above, write a Python script to convert this dataset "
+                    f"to erniekit JSONL format.\n"
+                    f"If you need more detail (e.g., to read a parquet schema or see "
+                    f"first few rows), use shell/python actions. "
+                    f"Otherwise, go directly to final_script."
                 ),
             }
         ]
@@ -349,9 +359,56 @@ class DataAgent:
             text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
         return json.loads(text)
 
+    def _pre_explore(self, source_path: str) -> str:
+        """Pre-explore a dataset directory and return a text summary for LLM context.
+
+        Runs real shell/python commands so the LLM starts with actual information.
+        """
+        lines = []
+
+        # 1. Directory listing with sizes
+        ls_out = self._run_shell(f"ls -lhR {source_path} | head -80")
+        lines.append(f"$ ls -lhR {source_path} | head -80\n{ls_out}")
+
+        # 2. File type summary
+        find_out = self._run_shell(
+            f"find {source_path} -type f | sed 's|.*\\.||' | sort | uniq -c | sort -rn | head -20"
+        )
+        lines.append(f"\nFile extensions summary:\n{find_out}")
+
+        # 3. Sample first file of each interesting type
+        for ext in ("parquet", "jsonl", "json", "csv", "tsv", "xml"):
+            find_file = self._run_shell(
+                f"find {source_path} -name '*.{ext}' -type f | head -1"
+            ).strip()
+            if find_file and find_file != "(no output)":
+                if ext == "parquet":
+                    sample = self._run_python_snippet(
+                        f"import pandas as pd\ndf = pd.read_parquet('{find_file}')\n"
+                        f"print('Shape:', df.shape)\nprint('Columns:', list(df.columns))\n"
+                        f"print('Dtypes:\\n', df.dtypes)\nprint('\\nFirst 2 rows:')\n"
+                        f"print(df.head(2).to_string(max_colwidth=80))",
+                        source_path,
+                    )
+                    lines.append(f"\nParquet sample ({find_file}):\n{sample}")
+                elif ext in ("jsonl", "json"):
+                    head = self._run_shell(f"head -3 {find_file}")
+                    lines.append(f"\n{ext.upper()} sample ({find_file}):\n{head}")
+                elif ext in ("csv", "tsv"):
+                    head = self._run_shell(f"head -5 {find_file}")
+                    lines.append(f"\n{ext.upper()} sample ({find_file}):\n{head}")
+                elif ext == "xml":
+                    head = self._run_shell(f"head -30 {find_file}")
+                    lines.append(f"\nXML sample ({find_file}):\n{head}")
+
+        summary = "\n".join(lines)
+        # Truncate to avoid huge context
+        if len(summary) > 8000:
+            summary = summary[:8000] + "\n...[pre-explore truncated]"
+        return summary
+
     def _run_shell(self, cmd: str) -> str:
         """Run a shell command safely and return output."""
-        # Block destructive commands
         blocked = ["rm -rf", "rm -f", "mkfs", "dd if=", "> /dev/", "shutdown", "reboot"]
         for b in blocked:
             if b in cmd:
@@ -363,15 +420,15 @@ class DataAgent:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
-                cwd=self.work_dir,
+                timeout=60,
+                cwd=self._user_cwd,        # run from user's original cwd
             )
             out = result.stdout
-            if result.stderr:
-                out += f"\n[stderr]: {result.stderr[:500]}"
+            if result.stderr and not result.stdout:
+                out = f"[stderr]: {result.stderr[:500]}"
             return out or "(no output)"
         except subprocess.TimeoutExpired:
-            return "[TIMEOUT] Command took too long (>30s)"
+            return "[TIMEOUT] Command took too long (>60s)"
         except Exception as e:
             return f"[ERROR] {e}"
 

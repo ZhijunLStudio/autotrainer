@@ -33,13 +33,14 @@ def data_command(
     cfg = AutoTrainerConfig.from_env()
     work_dir = output_dir or os.path.join(cfg.work_dir, "data")
 
-    # Validate paths and expand "collection directories"
+    # Validate paths, make absolute, and expand "collection directories"
     valid_paths = []
     for p in paths:
-        if not os.path.exists(p):
-            click.echo(f"  [WARN] Path not found: {p}", err=True)
+        abs_p = os.path.abspath(p)          # always resolve to absolute path
+        if not os.path.exists(abs_p):
+            click.echo(f"  [WARN] Path not found: {abs_p}", err=True)
             continue
-        expanded = _expand_path(p)
+        expanded = _expand_path(abs_p)
         valid_paths.extend(expanded)
 
     if not valid_paths:
