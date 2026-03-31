@@ -7,14 +7,11 @@ import json
 import os
 import random
 import re
-import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import click
-
-from autotrainer.utils.file_utils import safe_read_json
 
 
 @dataclass
@@ -23,19 +20,26 @@ class DatasetInfo:
 
     name: str = ""
     repo_id: str = ""
-    source: str = ""  # huggingface / tavily / opendatalab / manual
+    source: str = ""  # huggingface / modelscope / kaggle / opendatalab / pwc / tavily
     url: str = ""
     description: str = ""
     downloads: int = 0
     size_hint: str = ""
     tags: list[str] = field(default_factory=list)
+    download_method: str = "hf"  # hf / modelscope / kaggle / manual
 
     def display(self, idx: int) -> str:
-        """Format for display in list."""
-        src = self.source[:10]
-        dl = f"{self.downloads:,}" if self.downloads else "-"
-        desc = self.description[:50] if self.description else ""
-        return f"  [{idx}] {self.name:<45} {src:<12} downloads={dl:<10} {desc}"
+        src_abbr = {
+            "huggingface": "HF",
+            "modelscope": "ModelScope",
+            "kaggle": "Kaggle",
+            "opendatalab": "OpenDataLab",
+            "pwc": "PapersWithCode",
+            "tavily": "Web",
+        }.get(self.source, self.source[:10])
+        dl = f"{self.downloads:,}" if self.downloads > 0 else "-"
+        desc = self.description[:55] if self.description else ""
+        return f"  [{idx:>2}] {self.name:<42} [{src_abbr:<12}] dl={dl:<10} {desc}"
 
 
 @dataclass
@@ -47,17 +51,14 @@ class PipelineResult:
     cleaned_path: str = ""
     converted_path: str = ""
     profile: dict = field(default_factory=dict)
-    dedup_stats: dict = field(default_factory=dict)
+    clean_stats: dict = field(default_factory=dict)
     split_result: dict = field(default_factory=dict)
     status: str = "completed"
     errors: list[str] = field(default_factory=list)
 
 
 class DataPipeline:
-    """Full data pipeline: search → select → download → clean → convert → profile → split.
-
-    One class that handles the entire data workflow end-to-end.
-    """
+    """Full data pipeline: search → interactive select → download → clean → convert → profile → split."""
 
     def __init__(self, cache_dir: str, paddleformers_root: str = ""):
         self.cache_dir = cache_dir
@@ -65,36 +66,50 @@ class DataPipeline:
         os.makedirs(cache_dir, exist_ok=True)
 
     # ══════════════════════════════════════════════════════════
-    # Step 1: Search (multi-source)
+    # Step 1: Multi-source search
     # ══════════════════════════════════════════════════════════
 
     def search(
         self,
         query: str,
-        hf_limit: int = 20,
-        tavily_limit: int = 10,
         tavily_key: str = "",
+        modelscope_token: str = "",
+        kaggle_configured: bool = False,
     ) -> list[DatasetInfo]:
-        """Search across multiple sources and return unified candidate list."""
-        candidates = []
+        """Search across all configured sources, deduplicate, return combined list."""
+        all_results: list[DatasetInfo] = []
 
-        # Source 1: HuggingFace Hub
-        hf_results = self._search_hf(query, limit=hf_limit)
-        candidates.extend(hf_results)
-
-        # Source 2: Tavily
+        sources = [
+            ("HuggingFace", lambda: self._search_hf(query, limit=20)),
+            ("ModelScope",  lambda: self._search_modelscope(query, limit=15, token=modelscope_token)),
+            ("PapersWithCode", lambda: self._search_pwc(query, limit=10)),
+        ]
+        if kaggle_configured:
+            sources.append(("Kaggle", lambda: self._search_kaggle(query, limit=10)))
         if tavily_key:
-            tavily_results = self._search_tavily(query, api_key=tavily_key, limit=tavily_limit)
-            candidates.extend(tavily_results)
+            sources.append(("Tavily", lambda: self._search_tavily(query, api_key=tavily_key, limit=10)))
 
-        # Deduplicate by repo_id
-        seen = set()
-        unique = []
-        for c in candidates:
+        for src_name, search_fn in sources:
+            click.echo(f"  Searching {src_name}...", nl=False)
+            try:
+                results = search_fn()
+                click.echo(f" {len(results)} results")
+                all_results.extend(results)
+            except Exception as e:
+                click.echo(f" failed ({e})")
+
+        # Dedup by repo_id → url → name
+        seen: set[str] = set()
+        unique: list[DatasetInfo] = []
+        for c in all_results:
             key = c.repo_id or c.url or c.name
-            if key not in seen:
+            if key and key not in seen:
                 seen.add(key)
                 unique.append(c)
+
+        # Sort: HF first (most reliable download), then others
+        order = {"huggingface": 0, "modelscope": 1, "pwc": 2, "kaggle": 3, "tavily": 4}
+        unique.sort(key=lambda x: (order.get(x.source, 9), -(x.downloads or 0)))
 
         return unique
 
@@ -102,256 +117,391 @@ class DataPipeline:
         """Search HuggingFace Hub."""
         try:
             from huggingface_hub import HfApi
-
             api = HfApi()
-            datasets = api.list_datasets(search=query, limit=limit)
+            datasets = list(api.list_datasets(search=query, limit=limit))
             return [
                 DatasetInfo(
-                    name=d.id.split("/")[-1] if "/" in d.id else d.id,
+                    name=d.id,
                     repo_id=d.id,
                     source="huggingface",
                     url=f"https://huggingface.co/datasets/{d.id}",
                     downloads=d.downloads or 0,
                     tags=list(d.tags or []),
+                    download_method="hf",
                 )
                 for d in datasets
             ]
         except Exception:
             return []
 
+    def _search_modelscope(self, query: str, limit: int = 15, token: str = "") -> list[DatasetInfo]:
+        """Search ModelScope (魔搭)."""
+        try:
+            from modelscope.hub.api import HubApi
+            api = HubApi()
+            datasets = api.list_datasets(query=query, page_number=1, page_size=limit)
+            results = []
+            for d in (datasets or []):
+                did = getattr(d, "Id", "") or getattr(d, "id", "") or ""
+                name = getattr(d, "Name", "") or getattr(d, "name", did) or did
+                dl = getattr(d, "Downloads", 0) or 0
+                results.append(DatasetInfo(
+                    name=name,
+                    repo_id=did,
+                    source="modelscope",
+                    url=f"https://modelscope.cn/datasets/{did}",
+                    downloads=int(dl),
+                    download_method="modelscope",
+                ))
+            return results
+        except Exception:
+            return []
+
+    def _search_pwc(self, query: str, limit: int = 10) -> list[DatasetInfo]:
+        """Search Papers With Code datasets API (no auth needed)."""
+        try:
+            import urllib.request, urllib.parse
+            q = urllib.parse.quote(query)
+            url = f"https://paperswithcode.com/api/v1/datasets/?q={q}&page_size={limit}"
+            req = urllib.request.Request(url, headers={"User-Agent": "autotrainer/0.1"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            results = []
+            for d in data.get("results", []):
+                results.append(DatasetInfo(
+                    name=d.get("name", ""),
+                    repo_id="",
+                    source="pwc",
+                    url=d.get("url", ""),
+                    description=d.get("description", "")[:120],
+                    download_method="manual",
+                ))
+            return results
+        except Exception:
+            return []
+
+    def _search_kaggle(self, query: str, limit: int = 10) -> list[DatasetInfo]:
+        """Search Kaggle datasets (requires kaggle CLI configured)."""
+        try:
+            result = subprocess.run(
+                ["kaggle", "datasets", "list", "-s", query, "--csv"],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode != 0:
+                return []
+            lines = result.stdout.strip().splitlines()
+            results = []
+            for line in lines[1:limit + 1]:  # skip header
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    ref = parts[0].strip()
+                    title = parts[1].strip()
+                    results.append(DatasetInfo(
+                        name=title or ref,
+                        repo_id=ref,
+                        source="kaggle",
+                        url=f"https://www.kaggle.com/datasets/{ref}",
+                        download_method="kaggle",
+                    ))
+            return results
+        except Exception:
+            return []
+
     def _search_tavily(self, query: str, api_key: str, limit: int = 10) -> list[DatasetInfo]:
-        """Search Tavily and extract HF dataset references."""
+        """Search Tavily and parse HF/ModelScope references out of results."""
         try:
             from tavily import TavilyClient
         except ImportError:
             return []
-
         try:
             client = TavilyClient(api_key=api_key)
-            response = client.search(query + " huggingface dataset", max_results=limit)
-
+            resp = client.search(query + " dataset download", max_results=limit)
             results = []
-            for r in response.get("results", []):
+            for r in resp.get("results", []):
                 title = r.get("title", "")
                 url = r.get("url", "")
-                snippet = r.get("content", "")[:200]
+                snippet = r.get("content", "")[:120]
 
-                # Try to extract HF repo_id from URL
-                repo_id = ""
-                hf_match = re.search(r"huggingface\.co/datasets/([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)", url)
+                # Try to promote to HF if URL contains a dataset ref
+                hf_match = re.search(r"huggingface\.co/datasets/([\w-]+/[\w.-]+)", url)
+                ms_match = re.search(r"modelscope\.cn/datasets/([\w-]+/[\w.-]+)", url)
+
                 if hf_match:
                     repo_id = hf_match.group(1)
-
-                results.append(
-                    DatasetInfo(
-                        name=title[:60],
+                    results.append(DatasetInfo(
+                        name=repo_id,
                         repo_id=repo_id,
-                        source="huggingface" if repo_id else "tavily",
+                        source="huggingface",
                         url=url,
                         description=snippet,
-                    )
-                )
+                        download_method="hf",
+                    ))
+                elif ms_match:
+                    repo_id = ms_match.group(1)
+                    results.append(DatasetInfo(
+                        name=repo_id,
+                        repo_id=repo_id,
+                        source="modelscope",
+                        url=url,
+                        description=snippet,
+                        download_method="modelscope",
+                    ))
+                else:
+                    results.append(DatasetInfo(
+                        name=title[:60],
+                        source="tavily",
+                        url=url,
+                        description=snippet,
+                        download_method="manual",
+                    ))
             return results
         except Exception:
             return []
 
     # ══════════════════════════════════════════════════════════
-    # Step 2: Download
+    # Step 2: Interactive selection (in-terminal)
+    # ══════════════════════════════════════════════════════════
+
+    def interactive_select(self, candidates: list[DatasetInfo]) -> list[DatasetInfo]:
+        """Show candidate list and prompt user to select which to download.
+
+        Returns the selected subset.
+        """
+        if not candidates:
+            return []
+
+        click.echo(f"\n  Found {len(candidates)} datasets. Enter numbers to download:")
+        click.echo(f"  {'':4} {'Name':<43} {'Source':<14} {'Downloads':<12} {'Description'}")
+        click.echo(f"  {'-' * 100}")
+        for i, c in enumerate(candidates, 1):
+            click.echo(c.display(i))
+
+        click.echo()
+        click.echo("  Enter numbers (e.g. 1,3,5), range (e.g. 1-5), 'all', or Enter to skip download:")
+        raw = click.prompt("  Select", default="", show_default=False)
+
+        raw = raw.strip()
+        if not raw or raw.lower() in ("q", "quit", "skip"):
+            return []
+        if raw.lower() == "all":
+            return candidates
+
+        indices: set[int] = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if "-" in part:
+                lo, _, hi = part.partition("-")
+                try:
+                    for n in range(int(lo), int(hi) + 1):
+                        indices.add(n - 1)
+                except ValueError:
+                    pass
+            elif part.isdigit():
+                indices.add(int(part) - 1)
+
+        selected = [candidates[i] for i in sorted(indices) if 0 <= i < len(candidates)]
+        if not selected:
+            click.echo("  No valid selection, skipping download.")
+        return selected
+
+    # ══════════════════════════════════════════════════════════
+    # Step 3: Download
     # ══════════════════════════════════════════════════════════
 
     def download(self, dataset: DatasetInfo) -> str:
-        """Download a dataset. Returns path to the downloaded file(s)."""
-        if dataset.source == "huggingface" and dataset.repo_id:
+        """Download a dataset. Returns local path (empty if failed)."""
+        method = dataset.download_method
+
+        if method == "hf" and dataset.repo_id:
             return self._download_hf(dataset.repo_id)
-        elif dataset.url:
+        elif method == "modelscope" and dataset.repo_id:
+            return self._download_modelscope(dataset.repo_id)
+        elif method == "kaggle" and dataset.repo_id:
+            return self._download_kaggle(dataset.repo_id)
+        else:
             click.echo(f"  Manual download required: {dataset.url}")
-            return ""
-        return ""
+            path = click.prompt(
+                "  Paste the local path after downloading (or Enter to skip)",
+                default="", show_default=False
+            )
+            return path.strip() if path.strip() else ""
 
     def _download_hf(self, repo_id: str) -> str:
-        """Download from HuggingFace Hub."""
         from huggingface_hub import snapshot_download
-
-        download_dir = os.path.join(self.cache_dir, "downloads", repo_id.replace("/", "_"))
-        click.echo(f"  Downloading {repo_id} to {download_dir}...")
-
+        dst = os.path.join(self.cache_dir, "downloads", repo_id.replace("/", "__"))
+        click.echo(f"  Downloading {repo_id} from HuggingFace...")
         try:
-            path = snapshot_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                local_dir=download_dir,
-            )
-            click.echo(f"  Downloaded to: {path}")
+            path = snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=dst)
+            click.echo(f"  Saved to: {path}")
             return path
         except Exception as e:
-            click.echo(f"  Download failed: {e}")
-            return ""
+            click.echo(f"  [FAIL] {e}")
+            # Offer manual fallback
+            manual = click.prompt(
+                "  Download failed. Paste local path if you downloaded manually (or Enter to skip)",
+                default="", show_default=False
+            )
+            return manual.strip() if manual.strip() else ""
+
+    def _download_modelscope(self, repo_id: str) -> str:
+        dst = os.path.join(self.cache_dir, "downloads", repo_id.replace("/", "__"))
+        click.echo(f"  Downloading {repo_id} from ModelScope...")
+        try:
+            from modelscope.msdatasets import MsDataset
+            ds = MsDataset.load(repo_id, cache_dir=dst)
+            click.echo(f"  Saved to: {dst}")
+            return dst
+        except Exception as e:
+            click.echo(f"  [FAIL] {e}")
+            manual = click.prompt(
+                "  Paste local path if downloaded manually (or Enter to skip)",
+                default="", show_default=False
+            )
+            return manual.strip() if manual.strip() else ""
+
+    def _download_kaggle(self, ref: str) -> str:
+        dst = os.path.join(self.cache_dir, "downloads", ref.replace("/", "__"))
+        os.makedirs(dst, exist_ok=True)
+        click.echo(f"  Downloading {ref} from Kaggle...")
+        try:
+            result = subprocess.run(
+                ["kaggle", "datasets", "download", ref, "--unzip", "-p", dst],
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode == 0:
+                click.echo(f"  Saved to: {dst}")
+                return dst
+            else:
+                click.echo(f"  [FAIL] {result.stderr[:200]}")
+        except Exception as e:
+            click.echo(f"  [FAIL] {e}")
+
+        manual = click.prompt(
+            "  Paste local path if downloaded manually (or Enter to skip)",
+            default="", show_default=False
+        )
+        return manual.strip() if manual.strip() else ""
 
     # ══════════════════════════════════════════════════════════
-    # Step 3: Find data files in download directory
+    # Step 4: Find data files in downloaded directory
     # ══════════════════════════════════════════════════════════
 
-    def find_data_files(self, download_path: str) -> list[str]:
-        """Find all data files (JSONL/JSON/CSV) in a download directory."""
-        data_files = []
+    def find_data_files(self, path: str) -> list[str]:
+        """Recursively find all data files (JSONL/JSON/CSV/TSV/Parquet)."""
         extensions = {".jsonl", ".json", ".csv", ".tsv", ".parquet"}
-
-        p = Path(download_path)
-        if p.is_file() and p.suffix in extensions:
+        p = Path(path)
+        if p.is_file() and p.suffix.lower() in extensions:
             return [str(p)]
-
-        if p.is_dir():
-            for root, dirs, files in os.walk(p):
-                for f in files:
-                    if Path(f).suffix in extensions:
-                        data_files.append(os.path.join(root, f))
-
-        return sorted(data_files)
+        files = []
+        for root, _, filenames in os.walk(p):
+            for fn in filenames:
+                if Path(fn).suffix.lower() in extensions:
+                    files.append(os.path.join(root, fn))
+        return sorted(files)
 
     # ══════════════════════════════════════════════════════════
-    # Step 4: Clean (dedup, remove bad rows, normalize)
+    # Step 5: Clean
     # ══════════════════════════════════════════════════════════
 
     def clean(self, src: str, dst: str) -> dict:
-        """Clean a data file: remove duplicates, bad rows, normalize.
-
-        Returns cleaning stats.
-        """
+        """Remove bad JSON, duplicates (by MD5), empty content, normalize whitespace."""
         stats = {
-            "input_lines": 0,
-            "valid_lines": 0,
-            "json_errors": 0,
-            "duplicates": 0,
-            "empty_content": 0,
-            "output_lines": 0,
+            "input_lines": 0, "valid_lines": 0,
+            "json_errors": 0, "duplicates": 0,
+            "empty_content": 0, "output_lines": 0,
         }
+        seen_hashes: set[str] = set()
+        cleaned: list[str] = []
 
-        seen_hashes = set()
-        cleaned_lines = []
-
-        with open(src, "r") as fin:
+        with open(src, "r", errors="replace") as fin:
             for line in fin:
                 stats["input_lines"] += 1
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
-
-                # JSON validation
                 try:
-                    data = json.loads(line)
+                    data = json.loads(stripped)
                 except json.JSONDecodeError:
                     stats["json_errors"] += 1
                     continue
-
-                # Dedup by content hash
-                content_hash = hashlib.md5(line.encode()).hexdigest()
-                if content_hash in seen_hashes:
+                h = hashlib.md5(stripped.encode()).hexdigest()
+                if h in seen_hashes:
                     stats["duplicates"] += 1
                     continue
-                seen_hashes.add(content_hash)
-
-                # Check for empty content
-                if self._is_empty_sample(data):
+                seen_hashes.add(h)
+                if self._is_empty(data):
                     stats["empty_content"] += 1
                     continue
-
-                # Normalize
-                normalized = self._normalize_sample(data)
-                cleaned_lines.append(json.dumps(normalized, ensure_ascii=False) + "\n")
+                normalized = self._normalize(data)
+                cleaned.append(json.dumps(normalized, ensure_ascii=False) + "\n")
                 stats["valid_lines"] += 1
 
-        # Write cleaned file
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         with open(dst, "w") as fout:
-            fout.writelines(cleaned_lines)
+            fout.writelines(cleaned)
 
-        stats["output_lines"] = len(cleaned_lines)
+        stats["output_lines"] = len(cleaned)
         return stats
 
-    def _is_empty_sample(self, data: dict) -> bool:
-        """Check if a sample has no meaningful content."""
-        # erniekit format
+    def _is_empty(self, data: dict) -> bool:
         if "text_info" in data:
-            text_info = data.get("text_info", [])
-            if isinstance(text_info, list):
-                has_text = any(
-                    isinstance(t, dict) and str(t.get("text", "")).strip() for t in text_info
-                )
-                return not has_text
-        # messages format
+            return not any(
+                isinstance(t, dict) and str(t.get("text", "")).strip()
+                for t in (data.get("text_info") or [])
+            )
         if "messages" in data:
-            messages = data.get("messages", [])
-            if isinstance(messages, list):
-                has_content = any(
-                    isinstance(m, dict) and str(m.get("content", "")).strip() for m in messages
-                )
-                return not has_content
+            return not any(
+                isinstance(m, dict) and str(m.get("content", "")).strip()
+                for m in (data.get("messages") or [])
+            )
         return False
 
-    def _normalize_sample(self, data: dict) -> dict:
-        """Normalize a sample (strip whitespace, etc.)."""
-        # Normalize text_info
+    def _normalize(self, data: dict) -> dict:
         if "text_info" in data and isinstance(data["text_info"], list):
             for item in data["text_info"]:
                 if isinstance(item, dict) and "text" in item:
                     item["text"] = str(item["text"]).strip()
-
-        # Normalize messages
         if "messages" in data and isinstance(data["messages"], list):
             for msg in data["messages"]:
                 if isinstance(msg, dict) and "content" in msg:
                     msg["content"] = str(msg["content"]).strip()
-
         return data
 
     # ══════════════════════════════════════════════════════════
-    # Step 5: Convert format
+    # Step 6: Detect format and convert
     # ══════════════════════════════════════════════════════════
 
     def detect_format(self, path: str) -> str:
-        """Auto-detect the format of a data file."""
         from autotrainer.pf_integration.dataset_validator import DatasetValidator
-
-        validator = DatasetValidator()
-        result = validator.validate_file(path)
-        return result.format_detected or "unknown"
+        return DatasetValidator().validate_file(path).format_detected or "unknown"
 
     def convert(self, src: str, dst: str, src_fmt: str, dst_fmt: str) -> dict:
-        """Convert data format."""
         from autotrainer.pf_integration.format_converter import convert
-
         return convert(src, dst, src_fmt, dst_fmt, base_dir=os.path.dirname(src))
 
     # ══════════════════════════════════════════════════════════
-    # Step 6: Profile
+    # Step 7: Profile
     # ══════════════════════════════════════════════════════════
 
     def profile(self, path: str) -> dict:
-        """Generate a statistical profile of a dataset."""
         p = Path(path)
         if not p.exists():
             return {"error": "file not found"}
 
-        profile = {
-            "path": path,
-            "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
-            "format": self.detect_format(path),
-        }
-
-        # Count lines and stats
-        text_lens = []
+        fmt = self.detect_format(path)
+        text_lens: list[int] = []
         field_counts: dict[str, int] = {}
         json_errors = 0
         line_count = 0
         image_count = 0
 
-        with open(path, "r") as f:
+        with open(path, "r", errors="replace") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                s = line.strip()
+                if not s:
                     continue
                 try:
-                    data = json.loads(line)
+                    data = json.loads(s)
                 except json.JSONDecodeError:
                     json_errors += 1
                     continue
@@ -360,44 +510,37 @@ class DataPipeline:
                 for key in data:
                     field_counts[key] = field_counts.get(key, 0) + 1
 
-                # Text lengths
                 if "text_info" in data:
                     tl = data.get("text_info", [])
-                    if isinstance(tl, list):
-                        total = sum(len(str(t.get("text", ""))) for t in tl if isinstance(t, dict))
-                        text_lens.append(total)
+                    text_lens.append(sum(len(str(t.get("text", ""))) for t in (tl or []) if isinstance(t, dict)))
                     imgs = data.get("image_info", [])
-                    if isinstance(imgs, list):
-                        image_count += len(imgs)
+                    image_count += len(imgs) if isinstance(imgs, list) else 0
                 elif "messages" in data:
                     msgs = data.get("messages", [])
-                    if isinstance(msgs, list):
-                        total = sum(len(str(m.get("content", ""))) for m in msgs if isinstance(m, dict))
-                        text_lens.append(total)
+                    text_lens.append(sum(len(str(m.get("content", ""))) for m in (msgs or []) if isinstance(m, dict)))
                     imgs = data.get("images", [])
-                    if isinstance(imgs, list):
-                        image_count += len(imgs)
+                    image_count += len(imgs) if isinstance(imgs, list) else (1 if imgs else 0)
 
-        profile["num_samples"] = line_count
-        profile["json_errors"] = json_errors
-        profile["image_count"] = image_count
-        profile["has_images"] = image_count > 0
-        profile["field_coverage"] = {k: round(v / line_count, 2) for k, v in field_counts.items()} if line_count else {}
-
+        result: dict = {
+            "path": path,
+            "size_mb": round(p.stat().st_size / 1024 / 1024, 2),
+            "format": fmt,
+            "num_samples": line_count,
+            "json_errors": json_errors,
+            "image_count": image_count,
+            "has_images": image_count > 0,
+            "field_coverage": {k: round(v / line_count, 2) for k, v in field_counts.items()} if line_count else {},
+        }
         if text_lens:
             s = sorted(text_lens)
             n = len(s)
-            profile["text_lengths"] = {
-                "min": s[0],
-                "max": s[-1],
-                "avg": round(sum(s) / n),
-                "p50": s[n // 2],
-                "p95": s[int(n * 0.95)] if n > 20 else s[-1],
+            result["text_lengths"] = {
+                "min": s[0], "max": s[-1], "avg": round(sum(s) / n),
+                "p50": s[n // 2], "p95": s[int(n * 0.95)] if n > 20 else s[-1],
             }
-
-        # Sample preview
-        samples = []
-        with open(path, "r") as f:
+        # sample preview
+        samples: list[dict] = []
+        with open(path, "r", errors="replace") as f:
             for i, line in enumerate(f):
                 if i >= 3:
                     break
@@ -405,45 +548,33 @@ class DataPipeline:
                     samples.append(json.loads(line.strip()))
                 except json.JSONDecodeError:
                     pass
-        profile["sample_preview"] = samples
-
-        return profile
+        result["sample_preview"] = samples
+        return result
 
     # ══════════════════════════════════════════════════════════
-    # Step 7: Split
+    # Step 8: Split
     # ══════════════════════════════════════════════════════════
 
     def split(self, path: str, train_ratio: float = 0.9, val_ratio: float = 0.05, seed: int = 42) -> dict:
-        """Split dataset into train/val/test."""
         random.seed(seed)
-
         with open(path, "r") as f:
             lines = f.readlines()
-
         random.shuffle(lines)
         n = len(lines)
-        train_end = int(n * train_ratio)
-        val_end = train_end + int(n * val_ratio)
-
-        base_dir = os.path.dirname(path)
-        base_name = Path(path).stem
-
+        t = int(n * train_ratio)
+        v = t + int(n * val_ratio)
+        base = Path(path)
         parts = {}
-        for name, start, end in [
-            ("train", 0, train_end),
-            ("val", train_end, val_end),
-            ("test", val_end, n),
-        ]:
-            part_path = os.path.join(base_dir, f"{base_name}_{name}.jsonl")
+        for name, start, end in [("train", 0, t), ("val", t, v), ("test", v, n)]:
+            part_path = str(base.parent / f"{base.stem}_{name}.jsonl")
             with open(part_path, "w") as f:
                 f.writelines(lines[start:end])
             parts[name] = {"path": part_path, "count": end - start}
-
         parts["total"] = n
         return parts
 
     # ══════════════════════════════════════════════════════════
-    # Full pipeline: search → select → download → clean → convert → profile → split
+    # Full pipeline
     # ══════════════════════════════════════════════════════════
 
     def run_full_pipeline(
@@ -452,165 +583,142 @@ class DataPipeline:
         task: str = "paddleocr-vl",
         target_format: str = "erniekit",
         tavily_key: str = "",
+        modelscope_token: str = "",
         output_dir: str = "",
     ) -> list[PipelineResult]:
-        """Run the complete data pipeline for selected datasets.
-
-        1. Search
-        2. User selects
-        3. Download each
-        4. Find data files
-        5. Clean (dedup, bad rows)
-        6. Convert to target format
-        7. Profile
-        8. Split (train/val/test)
-        """
+        """Search → interactive select → download → clean → convert → profile → split."""
         if not output_dir:
             output_dir = os.path.join(self.cache_dir, "processed", task)
         os.makedirs(output_dir, exist_ok=True)
 
-        # Step 1: Search
-        click.echo(f"\n[Step 1] Searching: {query}")
-        candidates = self.search(query, tavily_key=tavily_key)
+        # 1. Search
+        click.echo(f"\n[1/7] Searching: {query}")
+        kaggle_ok = subprocess.run(["kaggle", "--version"], capture_output=True).returncode == 0
+        candidates = self.search(query, tavily_key=tavily_key, modelscope_token=modelscope_token, kaggle_configured=kaggle_ok)
 
         if not candidates:
             click.echo("  No datasets found.")
             return []
 
-        # Step 2: Display and select
-        click.echo(f"\n[Step 2] Select datasets to download:")
-        click.echo(f"  {'#':<5} {'Name':<46} {'Source':<13} {'Info'}")
-        click.echo(f"  {'-' * 90}")
-        for i, c in enumerate(candidates, 1):
-            click.echo(c.display(i))
-
-        click.echo(f"\n  Enter numbers to download (e.g., 1,3,5), or 'all' for all, 'q' to quit:")
-        selection = click.prompt("  Select", default="1")
-
-        if selection.lower() == "q":
-            return []
-
-        if selection.lower() == "all":
-            selected_indices = list(range(len(candidates)))
-        else:
-            selected_indices = [int(x.strip()) - 1 for x in selection.split(",") if x.strip().isdigit()]
-
-        selected = [candidates[i] for i in selected_indices if 0 <= i < len(candidates)]
+        # 2. Interactive selection
+        click.echo(f"\n[2/7] Select datasets to download:")
+        selected = self.interactive_select(candidates)
         if not selected:
-            click.echo("  No valid selection.")
+            click.echo("  No selection, exiting.")
             return []
 
-        results = []
+        results: list[PipelineResult] = []
 
         for ds in selected:
-            click.echo(f"\n{'=' * 60}")
-            click.echo(f"Processing: {ds.name} ({ds.repo_id or ds.url})")
-            click.echo(f"{'=' * 60}")
+            click.echo(f"\n{'═' * 65}")
+            click.echo(f"  {ds.name}  [{ds.source}]  {ds.url}")
+            click.echo(f"{'═' * 65}")
 
-            result = PipelineResult(dataset_name=ds.name)
+            res = PipelineResult(dataset_name=ds.name)
 
-            # Step 3: Download
-            click.echo(f"\n[Step 3] Downloading...")
-            download_path = self.download(ds)
-            if not download_path:
-                result.status = "download_failed"
-                result.errors.append("Download failed")
-                results.append(result)
+            # 3. Download
+            click.echo(f"\n[3/7] Downloading...")
+            dl_path = self.download(ds)
+            if not dl_path:
+                res.status = "download_failed"
+                res.errors.append("Download failed or skipped")
+                results.append(res)
                 continue
 
-            # Step 4: Find data files
-            click.echo(f"\n[Step 4] Finding data files...")
-            data_files = self.find_data_files(download_path)
-            click.echo(f"  Found {len(data_files)} data files")
+            # 4. Find data files
+            click.echo(f"\n[4/7] Finding data files in {dl_path}...")
+            data_files = self.find_data_files(dl_path)
+            click.echo(f"  Found {len(data_files)} file(s): {[os.path.basename(f) for f in data_files]}")
             if not data_files:
-                result.status = "no_data_files"
-                result.errors.append("No data files found in download")
-                results.append(result)
+                res.status = "no_data_files"
+                res.errors.append("No data files found")
+                results.append(res)
                 continue
 
-            # Process each data file
-            ds_output_dir = os.path.join(output_dir, ds.name.replace("/", "_"))
-            os.makedirs(ds_output_dir, exist_ok=True)
+            ds_dir = os.path.join(output_dir, re.sub(r"[/\\]", "__", ds.name))
+            os.makedirs(ds_dir, exist_ok=True)
 
             for data_file in data_files:
                 fname = Path(data_file).name
-                click.echo(f"\n  Processing: {fname}")
+                click.echo(f"\n  File: {fname}")
 
-                # Step 5: Clean
-                click.echo(f"  [Step 5] Cleaning (dedup, remove bad rows)...")
-                cleaned_path = os.path.join(ds_output_dir, f"cleaned_{fname}")
-                clean_stats = self.clean(data_file, cleaned_path)
+                # 5. Clean
+                click.echo(f"  [5/7] Cleaning...")
+                cleaned_path = os.path.join(ds_dir, f"cleaned_{fname}")
+                stats = self.clean(data_file, cleaned_path)
                 click.echo(
-                    f"    Input: {clean_stats['input_lines']}, "
-                    f"JSON errors: {clean_stats['json_errors']}, "
-                    f"Duplicates: {clean_stats['duplicates']}, "
-                    f"Empty: {clean_stats['empty_content']}, "
-                    f"Output: {clean_stats['output_lines']}"
+                    f"    {stats['input_lines']} in → "
+                    f"dupes={stats['duplicates']}, "
+                    f"bad_json={stats['json_errors']}, "
+                    f"empty={stats['empty_content']} → "
+                    f"{stats['output_lines']} out"
                 )
-                result.cleaned_path = cleaned_path
-                result.dedup_stats = clean_stats
+                res.cleaned_path = cleaned_path
+                res.clean_stats = stats
 
-                # Step 6: Convert if needed
-                click.echo(f"  [Step 6] Detecting format...")
+                if stats["output_lines"] == 0:
+                    click.echo("    [WARN] No usable lines after cleaning, skipping.")
+                    continue
+
+                # 6. Convert if needed
+                click.echo(f"  [6/7] Format conversion...")
                 src_fmt = self.detect_format(cleaned_path)
-                click.echo(f"    Detected: {src_fmt}")
-
-                if src_fmt != target_format and src_fmt != "unknown":
-                    click.echo(f"    Converting {src_fmt} → {target_format}...")
-                    converted_path = os.path.join(ds_output_dir, f"converted_{fname}")
-                    conv_stats = self.convert(cleaned_path, converted_path, src_fmt, target_format)
-                    click.echo(f"    Converted: {conv_stats.get('converted', 0)} samples, skipped: {conv_stats.get('skipped', 0)}")
-                    result.converted_path = converted_path
-                    final_path = converted_path
+                click.echo(f"    Detected: {src_fmt or 'unknown'}")
+                if src_fmt and src_fmt != "unknown" and src_fmt != target_format:
+                    converted_path = os.path.join(ds_dir, f"converted_{fname}")
+                    conv = self.convert(cleaned_path, converted_path, src_fmt, target_format)
+                    click.echo(f"    {src_fmt} → {target_format}: {conv.get('converted', 0)} converted, {conv.get('skipped', 0)} skipped")
+                    res.converted_path = converted_path
+                    final = converted_path
                 else:
-                    final_path = cleaned_path
+                    click.echo(f"    Already {target_format or src_fmt}, no conversion needed")
+                    final = cleaned_path
 
-                # Step 7: Profile
-                click.echo(f"  [Step 7] Profiling...")
-                prof = self.profile(final_path)
-                result.profile = prof
-                click.echo(f"    Samples: {prof.get('num_samples', 0)}")
-                click.echo(f"    Size: {prof.get('size_mb', 0)} MB")
-                click.echo(f"    Has images: {prof.get('has_images', False)}")
+                # 7. Profile
+                click.echo(f"  [7/7] Profiling...")
+                prof = self.profile(final)
+                res.profile = prof
                 tl = prof.get("text_lengths", {})
+                click.echo(f"    {prof.get('num_samples', 0)} samples, {prof.get('size_mb', 0)} MB, images={prof.get('image_count', 0)}")
                 if tl:
-                    click.echo(f"    Text lengths: min={tl.get('min', 0)}, avg={tl.get('avg', 0)}, max={tl.get('max', 0)}")
+                    click.echo(f"    text: min={tl['min']}, avg={tl['avg']}, p95={tl['p95']}, max={tl['max']}")
+                if prof.get("sample_preview"):
+                    click.echo(f"    Preview of first sample:")
+                    sample = prof["sample_preview"][0]
+                    click.echo(f"      {json.dumps(sample, ensure_ascii=False)[:200]}")
 
-                # Step 8: Split
-                click.echo(f"  [Step 8] Splitting train/val/test...")
-                split_result = self.split(final_path)
-                result.split_result = split_result
+                # 8. Split
+                click.echo(f"\n  Splitting train/val/test (90/5/5)...")
+                split_r = self.split(final)
+                res.split_result = split_r
                 click.echo(
-                    f"    train={split_result.get('train', {}).get('count', 0)}, "
-                    f"val={split_result.get('val', {}).get('count', 0)}, "
-                    f"test={split_result.get('test', {}).get('count', 0)}"
+                    f"    train={split_r['train']['count']}, "
+                    f"val={split_r['val']['count']}, "
+                    f"test={split_r['test']['count']}"
                 )
+                click.echo(f"    train → {split_r['train']['path']}")
+                res.download_path = final
+                res.status = "completed"
 
-                result.download_path = final_path
-                result.status = "completed"
+            results.append(res)
 
-            results.append(result)
-
-        # Save pipeline summary
+        # Summary
         summary_path = os.path.join(output_dir, "pipeline_summary.json")
-        summary = {
-            "query": query,
-            "task": task,
-            "target_format": target_format,
-            "results": [
-                {
-                    "dataset": r.dataset_name,
-                    "status": r.status,
-                    "num_samples": r.profile.get("num_samples", 0),
-                    "cleaned_path": r.cleaned_path,
-                    "converted_path": r.converted_path,
-                    "errors": r.errors,
-                }
-                for r in results
-            ],
-        }
         with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        click.echo(f"\n  Pipeline summary saved to: {summary_path}")
-
+            json.dump(
+                {
+                    "query": query, "task": task, "target_format": target_format,
+                    "results": [
+                        {
+                            "dataset": r.dataset_name, "status": r.status,
+                            "samples": r.profile.get("num_samples", 0),
+                            "train_path": r.split_result.get("train", {}).get("path", ""),
+                            "errors": r.errors,
+                        }
+                        for r in results
+                    ],
+                },
+                f, indent=2, ensure_ascii=False,
+            )
+        click.echo(f"\n  Summary → {summary_path}")
         return results

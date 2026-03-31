@@ -45,15 +45,21 @@ def run(task: str, gpus: str | None, resume: bool, no_tui: bool, config_override
 @cli.command()
 @click.option("--mode", type=click.Choice(["fixed", "expand", "discover"]), required=True, help="Data mode")
 @click.option("--task", type=str, required=True, help="Task name (e.g., paddleocr-vl)")
-@click.option("--data-path", type=str, default=None, help="Path to existing data (for fixed mode)")
+@click.option("--data-path", type=str, default=None, help="Path to existing data (fixed mode only)")
 @click.option("--output-dir", type=str, default=None, help="Output directory for processed data")
-@click.option("--query", type=str, default=None, help="Custom search query (for discover/expand mode)")
-@click.option("--full", "full_pipeline", is_flag=True, default=False, help="Run full pipeline: search → select → download → clean → convert → profile → split")
-def data(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None, full_pipeline: bool):
-    """Manage datasets. Use --full for the complete search-download-convert pipeline."""
-    from autotrainer.cli.data_cmd import data_command
+@click.option("--query", type=str, default=None, help="Custom search query (discover/expand mode)")
+def data(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None):
+    """Manage datasets.
 
-    data_command(mode=mode, task=task, data_path=data_path, output_dir=output_dir, query=query, full_pipeline=full_pipeline)
+    \b
+    Modes:
+      fixed     — validate/clean/profile/split existing local data
+      discover  — search across HF/ModelScope/Kaggle/PapersWithCode/Tavily,
+                  interactively select, download, clean, convert, profile, split
+      expand    — same as discover but tailored to find complementary data
+    """
+    from autotrainer.cli.data_cmd import data_command
+    data_command(mode=mode, task=task, data_path=data_path, output_dir=output_dir, query=query)
 
 
 @cli.command()

@@ -38,8 +38,7 @@ def init_config_file(path: str = "") -> str:
     template = """# AutoTrainer Configuration
 # Place at ~/.autotrainer/config.yaml
 
-# Path to PaddleFormers repository root
-# Leave empty for auto-detection
+# Path to PaddleFormers repository root (leave empty for auto-detection)
 paddleformers_root: ""
 
 # Working directory for experiments
@@ -50,6 +49,12 @@ llm:
   base_url: ""        # e.g., "http://localhost:8000/v1"
   api_key: ""
   model: ""           # e.g., "qwen-72b"
+
+# Data search sources
+search:
+  tavily_api_key: ""        # https://tavily.com — semantic web search
+  modelscope_token: ""      # https://modelscope.cn — 魔搭，optional
+  # kaggle: configure via `kaggle api` or ~/.kaggle/kaggle.json
 
 # Context window settings
 context:
@@ -180,6 +185,8 @@ class AutoTrainerConfig:
             cfg["skills_dir"] = file_cfg.get("skills_dir", cfg["skills_dir"])
 
             llm = file_cfg.get("llm", {})
+            search = file_cfg.get("search", {})
+            # support both old flat key and new nested key
             cfg["llm_base_url"] = llm.get("base_url", cfg["llm_base_url"])
             cfg["llm_api_key"] = llm.get("api_key", cfg["llm_api_key"])
             cfg["llm_model"] = llm.get("model", cfg["llm_model"])
