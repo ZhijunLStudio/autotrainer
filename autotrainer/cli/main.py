@@ -43,23 +43,27 @@ def run(task: str, gpus: str | None, resume: bool, no_tui: bool, config_override
 
 
 @cli.command()
-@click.option("--mode", type=click.Choice(["fixed", "expand", "discover"]), required=True, help="Data mode")
-@click.option("--task", type=str, required=True, help="Task name (e.g., paddleocr-vl)")
-@click.option("--data-path", type=str, default=None, help="Path to existing data (fixed mode only)")
+@click.option("--path", "paths", multiple=True, required=True, help="Data file or directory (can repeat)")
 @click.option("--output-dir", type=str, default=None, help="Output directory for processed data")
-@click.option("--query", type=str, default=None, help="Custom search query (discover/expand mode)")
-def data(mode: str, task: str, data_path: str | None, output_dir: str | None, query: str | None):
-    """Manage datasets.
+@click.option("--profile-only", is_flag=True, default=False, help="Only profile existing JSONL (no conversion)")
+@click.option("--split-only", is_flag=True, default=False, help="Only split existing JSONL into train/val/test")
+def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, split_only: bool):
+    """Process training data with LLM-driven format conversion.
 
     \b
-    Modes:
-      fixed     — validate/clean/profile/split existing local data
-      discover  — search across HF/ModelScope/Kaggle/PapersWithCode/Tavily,
-                  interactively select, download, clean, convert, profile, split
-      expand    — same as discover but tailored to find complementary data
+    Accepts any format: JSONL, JSON, CSV, TSV, Parquet, XML, ZIP, directories.
+    The LLM inspects your data samples and writes a conversion script
+    to transform it into erniekit JSONL format automatically.
+
+    \b
+    Examples:
+      autotrainer data --path /data/ocr_annotations/
+      autotrainer data --path /data/a.parquet --path /data/b.csv
+      autotrainer data --path /data/processed.jsonl --profile-only
+      autotrainer data --path /data/cleaned.jsonl --split-only
     """
     from autotrainer.cli.data_cmd import data_command
-    data_command(mode=mode, task=task, data_path=data_path, output_dir=output_dir, query=query)
+    data_command(paths=list(paths), output_dir=output_dir, profile_only=profile_only, split_only=split_only)
 
 
 @cli.command()
