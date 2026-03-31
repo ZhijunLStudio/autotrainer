@@ -112,57 +112,110 @@ class DataAgent:
     # Main entry point
     # ══════════════════════════════════════════════════════════
 
-    def run(self, data_paths: list[str], custom_script: str | None = None) -> list[DatasetResult]:
-        """Process a list of dataset paths, with resume support.
+    def run(
+        self,
+        data_paths: list[str],
+        custom_script: str | None = None,
+        parallel: int = 1,
+    ) -> list[DatasetResult]:
+        """Process datasets with a live dashboard and optional parallel workers.
 
         Args:
-            custom_script: Path to a pre-written Python conversion script.
-                           Skips LLM generation and uses this script directly.
-                           Useful for manual iteration after a failed run.
+            custom_script: Pre-written script path (skip LLM generation).
+            parallel: Number of concurrent dataset workers.
         """
-        total = len(data_paths)
-        results = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from autotrainer.managers.data_dashboard import DataProcessingDashboard, Phase
 
-        # Load existing index for resume
         index = safe_read_json(os.path.join(self.work_dir, "data_index.json")) or {"datasets": []}
         completed_paths = {
             d["source_path"] for d in index.get("datasets", [])
             if d.get("status") == "completed"
         }
 
-        for i, path in enumerate(data_paths, 1):
-            name = os.path.basename(path)
-            click.echo(f"\n{'═' * 65}")
-            click.echo(f"  [{i}/{total}] {name}")
-            click.echo(f"  Path: {path}")
-            if custom_script:
-                click.echo(f"  Script: {custom_script} (manual)")
+        to_process = [p for p in data_paths if p not in completed_paths or custom_script]
+        already_done = [p for p in data_paths if p not in to_process]
+        results_map: dict[str, DatasetResult] = {}
 
-            # Resume: skip already completed (unless custom_script forces re-run)
-            if path in completed_paths and not custom_script:
-                click.echo(f"  [SKIP] Already completed in previous run")
-                for d in index.get("datasets", []):
-                    if d["source_path"] == path:
-                        r = DatasetResult(**{k: v for k, v in d.items() if k in DatasetResult.__dataclass_fields__})
-                        results.append(r)
-                        break
-                continue
+        # Restore already-done results
+        for path in already_done:
+            for d in index.get("datasets", []):
+                if d["source_path"] == path:
+                    r = DatasetResult(**{k: v for k, v in d.items() if k in DatasetResult.__dataclass_fields__})
+                    results_map[path] = r
+                    break
 
-            click.echo(f"{'═' * 65}")
-            result = self._process_one(path, custom_script=custom_script)
-            results.append(result)
+        dashboard = DataProcessingDashboard(data_paths, parallel=min(parallel, max(1, len(to_process))))
+        for path in already_done:
+            st = dashboard.get_status(path)
+            if st:
+                st.update(Phase.SKIPPED, "already completed")
+
+        def _worker(path: str) -> DatasetResult:
+            st = dashboard.get_status(path)
+
+            def _notify(phase, message="", log_line=""):
+                if st:
+                    st.update(phase, message, log_line)
+                    dashboard.refresh()
+
+            result = self._process_one(path, custom_script=custom_script, notify=_notify)
+            if st:
+                if result.status == "completed":
+                    st.samples = result.profile.get("num_samples", 0)
+                    st.images = result.profile.get("image_count", 0)
+                    st.update(Phase.COMPLETED, f"train={result.split.get('train', {}).get('count', 0)}")
+                else:
+                    st.error = result.errors[0][:50] if result.errors else "failed"
+                    st.update(Phase.FAILED, st.error)
+                dashboard.refresh()
             self._save_result(result)
+            return result
 
-            # Inline status after each dataset
-            status_icon = "✓" if result.status == "completed" else "✗"
-            n = result.profile.get("num_samples", 0)
-            click.echo(f"\n  {status_icon} [{i}/{total}] {name}: {n} samples ({result.status})")
+        dashboard.start()
+        try:
+            n_workers = min(parallel, len(to_process)) if to_process else 1
+            if n_workers == 1:
+                for path in to_process:
+                    results_map[path] = _worker(path)
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="data-worker") as ex:
+                    futures = {ex.submit(_worker, p): p for p in to_process}
+                    for future in as_completed(futures):
+                        path = futures[future]
+                        try:
+                            results_map[path] = future.result()
+                        except Exception as e:
+                            results_map[path] = DatasetResult(
+                                source_path=path,
+                                dataset_name=os.path.basename(path),
+                                status="failed", errors=[str(e)],
+                            )
+                            st = dashboard.get_status(path)
+                            if st:
+                                st.error = str(e)[:60]
+                                st.update(Phase.FAILED)
+                            dashboard.refresh()
+        finally:
+            dashboard.stop()
 
+        results = [results_map[p] for p in data_paths if p in results_map]
         self._print_summary(results)
         return results
 
-    def _process_one(self, source_path: str, custom_script: str | None = None) -> DatasetResult:
-        """Run the full pipeline for one dataset."""
+    def _process_one(
+        self,
+        source_path: str,
+        custom_script: str | None = None,
+        notify: callable | None = None,
+    ) -> DatasetResult:
+        """Run the full pipeline for one dataset with dashboard notifications."""
+        from autotrainer.managers.data_dashboard import Phase as DPhase
+
+        def _n(phase, msg="", log=""):
+            if notify:
+                notify(phase, msg, log)
+
         name = Path(source_path).name
         ds_dir = os.path.join(self.work_dir, name)
         image_dir = os.path.join(ds_dir, "images")
@@ -179,15 +232,14 @@ class DataAgent:
 
         # ── Phase 1: Get conversion script ────────────────────
         if custom_script:
-            # Use manually provided script (skip LLM generation)
-            click.echo(f"\n  [1/5] Using provided script: {custom_script}")
+            _n(DPhase.GENERATING, f"using manual script")
             with open(custom_script, "r") as f:
                 script = f.read()
             result.react_steps = 0
         else:
-            click.echo(f"\n  [1/5] Exploring data and generating conversion script...")
+            _n(DPhase.EXPLORING, "pre-exploring directory structure")
             script, react_steps = asyncio.run(
-                self._react_loop(source_path, jsonl_path, image_dir)
+                self._react_loop(source_path, jsonl_path, image_dir, notify=notify)
             )
             result.react_steps = react_steps
 
@@ -195,6 +247,7 @@ class DataAgent:
             result.status = "failed"
             result.errors.append("Could not generate a conversion script")
             result.completed_at = datetime.now().isoformat()
+            _n(DPhase.FAILED, "no script generated")
             return result
 
         # Save the final script
@@ -204,9 +257,9 @@ class DataAgent:
         result.script_path = script_path
 
         # ── Phase 2: Execute + validate + fix loop ────────────
-        click.echo(f"\n  [2/5] Running conversion script...")
+        _n(DPhase.VALIDATING, f"quick validation (100 rows)")
         script, sandbox_result, attempts = self._run_with_retry(
-            script, source_path, jsonl_path, image_dir=image_dir
+            script, source_path, jsonl_path, image_dir=image_dir, notify=notify
         )
         result.script_attempts = attempts
 
@@ -218,59 +271,40 @@ class DataAgent:
             result.status = "failed"
             result.errors.append(f"Script failed after {attempts} attempts")
             result.completed_at = datetime.now().isoformat()
-            click.echo(f"\n  [FAIL] {sandbox_result.error_summary[:200]}")
-            click.echo(f"  Script saved at: {script_path}")
-            click.echo(f"  To fix manually and re-run:")
-            click.echo(f"    1. Edit: {script_path}")
-            click.echo(f"    2. Re-run: autotrainer data --path {source_path} --script {script_path}")
+            err_summary = sandbox_result.error_summary[:200]
+            _n(DPhase.FAILED, err_summary)
+            click.echo(f"\n  [FAIL] {err_summary}")
+            click.echo(f"  Script: {script_path}")
+            click.echo(f"  Fix: autotrainer data --path {source_path} --script {script_path}")
             return result
 
         result.raw_jsonl_path = jsonl_path
         n_imgs = sum(1 for _ in Path(image_dir).glob("*.png")) if Path(image_dir).exists() else 0
-        click.echo(f"  Converted {sandbox_result.output_rows} rows → {jsonl_path}")
-        if n_imgs:
-            click.echo(f"  Saved {n_imgs} images → {image_dir}")
+        _n(DPhase.CLEANING, f"{sandbox_result.output_rows} rows converted")
 
         # ── Phase 3: Standard post-processing ─────────────────
         from autotrainer.managers.data_pipeline import DataPipeline
         dp = DataPipeline(cache_dir=self.work_dir)
 
-        click.echo(f"\n  [3/5] Cleaning (dedup, bad rows)...")
         cleaned_path = os.path.join(ds_dir, f"cleaned_{name}.jsonl")
         stats = dp.clean(jsonl_path, cleaned_path)
         result.clean_stats = stats
         result.cleaned_path = cleaned_path
-        click.echo(
-            f"    {stats['input_lines']} → "
-            f"dupes={stats['duplicates']} bad={stats['json_errors']} "
-            f"empty={stats['empty_content']} → {stats['output_lines']} out"
-        )
 
         if stats["output_lines"] == 0:
             result.status = "failed"
             result.errors.append("Zero rows after cleaning")
             result.completed_at = datetime.now().isoformat()
+            _n(DPhase.FAILED, "zero rows after cleaning")
             return result
 
-        click.echo(f"\n  [4/5] Profiling...")
+        _n(DPhase.PROFILING, f"{stats['output_lines']} rows after cleaning")
         prof = dp.profile(cleaned_path)
         result.profile = prof
-        tl = prof.get("text_lengths", {})
-        click.echo(f"    {prof.get('num_samples', 0)} samples, {prof.get('size_mb', 0)}MB, images={prof.get('image_count', 0)}")
-        if tl:
-            click.echo(f"    text: avg={tl.get('avg', 0)} p95={tl.get('p95', 0)}")
-        if prof.get("sample_preview"):
-            preview = json.dumps(prof["sample_preview"][0], ensure_ascii=False)
-            click.echo(f"    preview: {preview[:200]}")
 
-        click.echo(f"\n  [5/5] Splitting 90/5/5...")
+        _n(DPhase.SPLITTING, f"{prof.get('num_samples', 0)} samples")
         split_r = dp.split(cleaned_path)
         result.split = split_r
-        click.echo(
-            f"    train={split_r['train']['count']} → {split_r['train']['path']}\n"
-            f"    val  ={split_r['val']['count']}\n"
-            f"    test ={split_r['test']['count']}"
-        )
 
         result.status = "completed"
         result.completed_at = datetime.now().isoformat()
@@ -285,6 +319,7 @@ class DataAgent:
         source_path: str,
         output_path: str,
         image_dir: str,
+        notify: callable | None = None,
     ) -> tuple[str, int]:
         """Run the ReAct exploration loop.
 
@@ -354,6 +389,9 @@ class DataAgent:
 
             if thought:
                 click.echo(f" {thought[:80]}")
+                if notify:
+                    from autotrainer.managers.data_dashboard import Phase as DPhase
+                    notify(DPhase.GENERATING, f"step {step}: {thought[:50]}")
 
             # ── Loop detection ─────────────────────────────────
             # If LLM repeats the same thought MAX_LOOP_REPEAT times, it's stuck.
@@ -621,6 +659,7 @@ _os.unlink(_tmp_path)
         source_path: str,
         output_path: str,
         image_dir: str = "",
+        notify: callable | None = None,
     ) -> tuple[str, SandboxResult, int]:
         """Two-phase execution: quick validation (100 rows) then full run.
 
@@ -630,8 +669,15 @@ _os.unlink(_tmp_path)
         last_result = SandboxResult()
         extra_env = {"IMAGE_DIR": image_dir} if image_dir else {}
         full_timeout = self._calc_timeout(source_path)
+        size_gb = self._calc_size_gb(source_path)
+
+        def _notify_run(msg, log=""):
+            if notify:
+                from autotrainer.managers.data_dashboard import Phase as DPhase
+                notify(DPhase.RUNNING, msg, log)
 
         # ── Phase 1: Quick validation on 100 rows ────────────────────────
+        _notify_run(f"quick validation (100 rows)")
         click.echo(f"  Quick validation (first {QUICK_VALIDATE_ROWS} rows)...", nl=False)
         quick_output = output_path + ".quick_validate"
 
@@ -685,9 +731,11 @@ _os.unlink(_tmp_path)
 
         # ── Phase 2: Full run with retry loop ────────────────────────────
         full_sandbox = Sandbox(timeout=full_timeout)
-        click.echo(f"  Full run (timeout={full_timeout}s for {self._calc_size_gb(source_path):.1f}GB)...")
+        _notify_run(f"full run {size_gb:.1f}GB (timeout={full_timeout}s)")
+        click.echo(f"  Full run (timeout={full_timeout}s for {size_gb:.1f}GB)...")
 
         for attempt in range(1, MAX_RETRY_SCRIPT + 1):
+            _notify_run(f"attempt {attempt}/{MAX_RETRY_SCRIPT}")
             click.echo(f"  Attempt {attempt}/{MAX_RETRY_SCRIPT}...", nl=False)
 
             ok, syntax_err = full_sandbox.validate_script(script)

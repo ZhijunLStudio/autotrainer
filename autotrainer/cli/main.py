@@ -47,9 +47,12 @@ def run(task: str, gpus: str | None, resume: bool, no_tui: bool, config_override
 @click.option("--output-dir", type=str, default=None, help="Output directory (default: ./autotrainer_output/)")
 @click.option("--profile-only", is_flag=True, default=False, help="Only profile existing JSONL (no conversion)")
 @click.option("--split-only", is_flag=True, default=False, help="Only split existing JSONL into train/val/test")
+@click.option("--parallel", type=int, default=1, show_default=True,
+              help="Number of concurrent dataset workers")
 @click.option("--script", "custom_script", type=click.Path(exists=True), default=None,
-              help="Use a pre-written conversion script instead of generating one (for manual fix iteration)")
-def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, split_only: bool, custom_script: str | None):
+              help="Use a pre-written conversion script (for manual fix iteration)")
+def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, split_only: bool,
+         parallel: int, custom_script: str | None):
     """Process training data with LLM-driven format conversion.
 
     \b
@@ -69,7 +72,7 @@ def data(paths: tuple[str, ...], output_dir: str | None, profile_only: bool, spl
     """
     from autotrainer.cli.data_cmd import data_command
     data_command(paths=list(paths), output_dir=output_dir, profile_only=profile_only,
-                 split_only=split_only, custom_script=custom_script)
+                 split_only=split_only, custom_script=custom_script, parallel=parallel)
 
 
 @cli.command()
