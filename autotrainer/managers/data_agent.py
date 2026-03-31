@@ -34,6 +34,7 @@ from autotrainer.utils.file_utils import atomic_write_json, safe_read_json
 MAX_REACT_STEPS = 15     # max exploration steps per dataset
 MAX_RETRY_SCRIPT = 3     # max times to retry fixing the script
 MAX_CMD_OUTPUT = 3000    # truncate command output to this length for context
+MAX_LOOP_REPEAT = 3      # if same thought appears this many times, force final_script
 
 
 @dataclass
@@ -264,6 +265,9 @@ class DataAgent:
             }
         ]
 
+        # Track repeated thoughts to detect loops
+        recent_thoughts: list[str] = []
+
         for step in range(1, MAX_REACT_STEPS + 1):
             click.echo(f"    Step {step}/{MAX_REACT_STEPS}...", nl=False)
 
@@ -286,11 +290,10 @@ class DataAgent:
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({
                     "role": "user",
-                    "content": f"Parse error: {e}. Please respond with valid JSON.",
+                    "content": f"Parse error: {e}. Please respond with valid JSON only.",
                 })
                 continue
 
-            # Append to history
             messages.append({"role": "assistant", "content": response_text})
 
             act_type = action.get("action", "")
@@ -298,6 +301,28 @@ class DataAgent:
 
             if thought:
                 click.echo(f" {thought[:80]}")
+
+            # ── Loop detection ─────────────────────────────────
+            # If LLM repeats the same thought MAX_LOOP_REPEAT times, it's stuck.
+            thought_key = thought[:60].strip().lower()
+            recent_thoughts.append(thought_key)
+            if len(recent_thoughts) > MAX_LOOP_REPEAT:
+                recent_thoughts.pop(0)
+            if (len(recent_thoughts) == MAX_LOOP_REPEAT
+                    and len(set(recent_thoughts)) == 1
+                    and act_type != "final_script"):
+                click.echo(f"\n    [Loop detected] Same thought repeated {MAX_LOOP_REPEAT}x. Forcing final_script.")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You have explored this dataset enough. "
+                        "You MUST now output a final_script action immediately. "
+                        "If there is no transcription text, use bounding box counts or "
+                        "class names as the answer. Do not explore further."
+                    ),
+                })
+                recent_thoughts.clear()
+                continue
 
             # ── final_script ──────────────────────────────────
             if act_type == "final_script":
@@ -500,8 +525,15 @@ class DataAgent:
                 error = "Output format invalid: " + "; ".join(validation.errors[:3])
                 click.echo(f" format invalid")
             elif result.output_rows == 0 and result.success:
-                error = "Script ran but produced 0 rows"
-                click.echo(f" 0 rows")
+                # Show stdout so LLM can see what happened
+                stdout_hint = result.stdout.strip()[-500:] if result.stdout.strip() else "(no stdout)"
+                error = (
+                    f"Script ran successfully but produced 0 output rows.\n"
+                    f"Script stdout: {stdout_hint}\n"
+                    f"Possible causes: wrong field names, all rows filtered out, "
+                    f"empty input file, or output not written to OUTPUT_PATH."
+                )
+                click.echo(f" 0 rows — {stdout_hint[:100]}")
             else:
                 error = result.error_summary
                 click.echo(f" failed")
