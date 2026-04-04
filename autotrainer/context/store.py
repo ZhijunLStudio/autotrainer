@@ -1,16 +1,21 @@
 """Context store — manages context window with percentage-based budgets.
 
-The context window is divided into sections, each with a token budget.
-Raw logs and large data never enter context directly — they are accessed
-through tools (file reads at specific offsets) when the LLM needs them.
+Enhanced with Claude Code-inspired auto-compaction:
+- BudgetTracker monitors token usage and detects diminishing returns
+- Auto-compact: when context exceeds 85%, truncate from head (oldest first)
+- Head-based truncation strategy (keep recent, drop old)
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from typing import Any
 
-from autotrainer.context.budget import ContextBudget
-from autotrainer.context.token_counter import estimate_tokens, truncate_to_tokens
+from autotrainer.context.budget import BudgetTracker, ContextBudget
+from autotrainer.context.token_counter import estimate_tokens, truncate_head, truncate_to_tokens
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,6 +63,14 @@ class ContextSection:
         self.items.clear()
         self.content = ""
 
+    def truncate_head(self, keep_ratio: float = 0.5):
+        """Truncate from the head (oldest items), keeping the newest fraction."""
+        if not self.items:
+            return
+        keep_count = max(1, int(len(self.items) * keep_ratio))
+        self.items = self.items[-keep_count:]
+        self.content = "\n".join(self.items)
+
 
 class ContextStore:
     """Manages LLM context windows with percentage-based token budgets.
@@ -68,11 +81,16 @@ class ContextStore:
         decision — experiment history, plan-experiment output
         working  — current task state, recent events
         response — reserved for LLM response (not user-settable)
+
+    Auto-compaction:
+        When total usage exceeds 85%, the decision section (oldest content)
+        is automatically truncated from the head, preserving recent context.
     """
 
     def __init__(self, max_tokens: int = 128_000, budget: ContextBudget | None = None):
         self.max_tokens = max_tokens
         self.budget = budget or ContextBudget()
+        self.budget_tracker = BudgetTracker()
         self._sections: dict[str, ContextSection] = {
             "system": ContextSection("system", self.budget.get_limit("system", max_tokens)),
             "data": ContextSection("data", self.budget.get_limit("data", max_tokens)),
@@ -107,13 +125,53 @@ class ContextStore:
         self._sections["working"].set(text)
 
     def build_prompt(self) -> str:
-        """Build the full context string from all sections."""
+        """Build the full context string from all sections.
+
+        Auto-checks budget before building and compacts if needed.
+        """
+        self._check_and_compact()
+
         parts = []
         for name in ["system", "data", "decision", "working"]:
             section = self._sections[name]
             if section.content:
                 parts.append(f"=== {name.upper()} ===\n{section.content}")
         return "\n\n".join(parts)
+
+    def _check_and_compact(self):
+        """Check budget and auto-compact if needed."""
+        total_used = self.total_used_tokens
+        result = self.budget_tracker.check_budget(total_used, self.max_tokens)
+
+        if result["action"] == "compact":
+            logger.warning("Auto-compacting context: %s (usage: %s)", result["reason"], result.get("usage_pct"))
+            self._compact()
+            self.budget_tracker.reset()
+        elif result["action"] == "stop":
+            logger.error("Context budget exhausted: %s", result["reason"])
+            self._compact()
+            self.budget_tracker.reset()
+
+    def _compact(self):
+        """Compact context by truncating the decision section from head.
+
+        Decision section is the primary target because it accumulates
+        experiment history over time — oldest entries are least relevant.
+        """
+        decision = self._sections["decision"]
+        if decision.items:
+            old_count = len(decision.items)
+            decision.truncate_head(keep_ratio=0.5)
+            logger.info(
+                "Compacted decision section: %d → %d items",
+                old_count, len(decision.items),
+            )
+
+        # If still too large, truncate working section too
+        if self.total_used_tokens > self.max_tokens * 0.9:
+            working = self._sections["working"]
+            if working.content:
+                working.content = truncate_head(working.content, working.max_tokens)
 
     def get_budget_report(self) -> dict[str, dict]:
         """Get a report of token usage vs budget for all sections."""

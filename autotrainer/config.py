@@ -5,16 +5,21 @@ Configuration is loaded in this priority order (later wins):
 2. Config file: ~/.autotrainer/config.yaml
 3. Environment variables: AUTOTRAINER_*
 4. CLI arguments (overrides)
+
+Enhanced with pydantic validation (inspired by Claude Code's zod schemas).
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
 
+logger = logging.getLogger(__name__)
 
 # Default config file location
 _DEFAULT_CONFIG_PATH = os.path.expanduser("~/.autotrainer/config.yaml")
@@ -54,7 +59,6 @@ llm:
 search:
   tavily_api_key: ""        # https://tavily.com — semantic web search
   modelscope_token: ""      # https://modelscope.cn — 魔搭，optional
-  # kaggle: configure via `kaggle api` or ~/.kaggle/kaggle.json
 
 # Context window settings
 context:
@@ -70,15 +74,75 @@ training:
 health:
   poll_interval: 5.0             # Seconds between health checks
   hang_timeout: 300.0            # Seconds before declaring hang
-
-# Tavily API key (optional, for broader data search)
-tavily_api_key: ""
 """
     if not os.path.exists(path):
         with open(path, "w") as f:
             f.write(template)
 
     return path
+
+
+# ── Pydantic validation schema ──────────────────────────────────────────────
+
+
+def _get_validator():
+    """Lazily import/create the pydantic validator to avoid hard dependency at import time."""
+    try:
+        from pydantic import BaseModel, Field, field_validator
+
+        class LLMConfig(BaseModel):
+            base_url: str = ""
+            api_key: str = ""
+            model: str = ""
+
+            @field_validator("base_url")
+            @classmethod
+            def validate_base_url(cls, v):
+                if v and not v.startswith(("http://", "https://")):
+                    raise ValueError(f"llm.base_url must start with http:// or https://, got: {v}")
+                return v
+
+        class TrainingConfig(BaseModel):
+            ablation_subset_ratio: float = Field(default=0.05, ge=0.001, le=1.0)
+            ablation_max_steps: int = Field(default=1000, ge=1)
+            full_epochs: int = Field(default=3, ge=1)
+
+        class HealthConfig(BaseModel):
+            poll_interval: float = Field(default=5.0, ge=0.5)
+            hang_timeout: float = Field(default=300.0, ge=10.0)
+
+        class ContextConfig(BaseModel):
+            max_tokens: int = Field(default=128000, ge=1000)
+
+        class AutoTrainerConfigSchema(BaseModel):
+            """Pydantic schema for config validation."""
+            work_dir: str = ""
+            paddleformers_root: str = ""
+            skills_dir: str = ""
+            llm: LLMConfig = Field(default_factory=LLMConfig)
+            training: TrainingConfig = Field(default_factory=TrainingConfig)
+            health: HealthConfig = Field(default_factory=HealthConfig)
+            context: ContextConfig = Field(default_factory=ContextConfig)
+
+        return AutoTrainerConfigSchema
+    except ImportError:
+        return None
+
+
+def validate_config(raw_config: dict) -> list[str]:
+    """Validate a raw config dict against the schema. Returns list of errors."""
+    Schema = _get_validator()
+    if Schema is None:
+        # No pydantic, skip validation
+        return []
+    try:
+        Schema(**raw_config)
+        return []
+    except Exception as e:
+        return [str(e)]
+
+
+# ── Main config class ───────────────────────────────────────────────────────
 
 
 @dataclass
@@ -113,12 +177,10 @@ class AutoTrainerConfig:
     @staticmethod
     def detect_paddleformers_root() -> str:
         """Auto-detect PaddleFormers installation."""
-        # Check common locations
         candidates = [
             os.environ.get("PADDLEFORMERS_ROOT"),
             os.path.expanduser("~/.local/lib/python3.10/site-packages/paddleformers"),
         ]
-        # Check parent of this project's location
         here = Path(__file__).resolve()
         for parent in here.parents:
             candidate = parent / "PaddleFormers"
@@ -133,11 +195,7 @@ class AutoTrainerConfig:
 
     @staticmethod
     def detect_model_path(model_id: str) -> str:
-        """Resolve model path: check local cache first, fall back to HF ID.
-
-        Checks common cache locations before returning the HF hub ID so
-        we avoid network calls when the model is already downloaded.
-        """
+        """Resolve model path: check local cache first, fall back to HF ID."""
         local_path = Path(f"/data-ssd/lizhijun/models/{model_id}")
         if (local_path / "config.json").exists():
             return str(local_path)
@@ -198,14 +256,12 @@ class AutoTrainerConfig:
         # Layer 2: config file
         file_cfg = _load_config_file(config_file)
         if file_cfg:
-            # Flat mapping from YAML structure to flat dict
             raw_work_dir = file_cfg.get("work_dir", cfg["work_dir"])
-            cfg["work_dir"] = os.path.expanduser(raw_work_dir)  # expand ~ properly
+            cfg["work_dir"] = os.path.expanduser(raw_work_dir)
             cfg["paddleformers_root"] = file_cfg.get("paddleformers_root", cfg["paddleformers_root"])
             cfg["skills_dir"] = file_cfg.get("skills_dir", cfg["skills_dir"])
 
             llm = file_cfg.get("llm", {})
-            search = file_cfg.get("search", {})  # noqa: F841 — used below via search.get(...)
             cfg["llm_base_url"] = llm.get("base_url", cfg["llm_base_url"])
             cfg["llm_api_key"] = llm.get("api_key", cfg["llm_api_key"])
             cfg["llm_model"] = llm.get("model", cfg["llm_model"])
@@ -221,6 +277,12 @@ class AutoTrainerConfig:
             health = file_cfg.get("health", {})
             cfg["health_poll_interval"] = health.get("poll_interval", cfg["health_poll_interval"])
             cfg["health_hang_timeout"] = health.get("hang_timeout", cfg["health_hang_timeout"])
+
+            # Validate with pydantic if available
+            errors = validate_config(file_cfg)
+            if errors:
+                for err in errors:
+                    logger.warning("Config validation warning: %s", err)
 
         # Layer 3: environment variables
         env_map = {
