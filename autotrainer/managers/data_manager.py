@@ -155,8 +155,15 @@ class DataManager:
         return profile
 
     def create_subset(self, src: str, dst: str, ratio: float, seed: int = 42):
-        """Create a random subset of a dataset."""
+        """Create a random subset of a dataset.
+
+        Rewrites relative image paths (./images/...) to absolute paths
+        so the subset can be used from any working directory.
+        """
+        import json
+
         random.seed(seed)
+        src_dir = os.path.dirname(src)
 
         lines = []
         with open(src, "r") as f:
@@ -165,11 +172,32 @@ class DataManager:
         subset_size = max(1, int(len(lines) * ratio))
         sampled = random.sample(lines, subset_size)
 
+        # Rewrite relative image paths to absolute
+        rewritten = []
+        for line in sampled:
+            line = line.strip()
+            if not line:
+                continue
+            if "./" in line:
+                try:
+                    data = json.loads(line)
+                    img_info = data.get("image_info")
+                    if isinstance(img_info, list):
+                        for img in img_info:
+                            if isinstance(img, dict):
+                                url = img.get("image_url", "")
+                                if url.startswith("./"):
+                                    img["image_url"] = os.path.join(src_dir, url[2:])
+                    line = json.dumps(data, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    pass
+            rewritten.append(line + "\n")
+
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         with open(dst, "w") as f:
-            f.writelines(sampled)
+            f.writelines(rewritten)
 
-        return {"total": len(lines), "subset": len(sampled), "ratio": ratio, "path": dst}
+        return {"total": len(lines), "subset": len(rewritten), "ratio": ratio, "path": dst}
 
     def search_hf(self, query: str, task: str = "", limit: int = 10) -> list[dict]:
         """Search HuggingFace Hub for datasets."""

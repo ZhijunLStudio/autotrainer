@@ -39,12 +39,12 @@ class LogParser:
     """Parse PaddleFormers training output for metrics and errors."""
 
     # Metric extraction patterns
-    LOSS_PATTERN = re.compile(r"loss[:\s]+(\d+\.?\d*)")
-    STEP_PATTERN = re.compile(r"(?:global_)?step[:\s]+(\d+)")
+    LOSS_PATTERN = re.compile(r"loss[:\s]+(\d+\.\d+)")
+    STEP_PATTERN = re.compile(r"global_step[:\s]+(\d+)")
     LR_PATTERN = re.compile(r"(?:learning_rate|lr)[:\s]+([\d.eE+-]+)")
     MEM_PATTERN = re.compile(r"(?:allocated_memory|memory)[:\s]+([\d.]+)\s*MB")
     SPEED_PATTERN = re.compile(r"(?:throughput|speed)[:\s]+([\d.]+)\s*tokens/s")
-    EVAL_PATTERN = re.compile(r"eval[_\s].*?loss[:\s]+(\d+\.?\d*)")
+    EVAL_PATTERN = re.compile(r"eval[_\s].*?loss[:\s]+(\d+\.\d+)")
     EPOCH_PATTERN = re.compile(r"epoch[:\s]+(\d+)")
 
     # Error patterns
@@ -132,7 +132,8 @@ class LogParser:
         if re.search(r"(?:^|\s)ERROR", line):
             return LogError(error_type="ERROR", message=line.strip(), raw_line=line, severity="error")
 
-        if re.search(r"(?:^|\s)WARNING", line, re.IGNORECASE):
+        # Only flag meaningful warnings, not NCCL/LAUNCH noise
+        if re.search(r"(?:^|\s)WARNING", line, re.IGNORECASE) and not re.search(r"NCCL|LAUNCH|RAS", line):
             return LogError(error_type="WARNING", message=line.strip(), raw_line=line, severity="warning")
 
         return None
@@ -149,27 +150,46 @@ class LogParser:
     def extract_final_metrics(self, log_path: str) -> dict:
         """Extract final training metrics from a log file.
 
-        Returns dict with: final_loss, final_step, total_epochs, etc.
+        Returns dict with: final_loss, final_step, max_steps, total_epochs, etc.
         """
         p = Path(log_path)
         if not p.exists():
             return {}
 
-        # Read last 100 lines for final metrics
+        # Read last 200 lines for final metrics
         with open(log_path, "r", errors="replace") as f:
             lines = f.readlines()
-        tail = "".join(lines[-100:])
+
+        # Extract max_steps from the header (look in first 2000 lines)
+        max_steps = 0
+        for line in lines[:2000]:
+            m = re.search(r"Total optimization steps\s*=\s*([\d,]+)", line)
+            if m:
+                max_steps = int(m.group(1).replace(",", ""))
+                break
+
+        tail = "".join(lines[-200:])
 
         metrics_list = self.extract_metrics(tail)
         if not metrics_list:
             return {}
 
-        last = metrics_list[-1]
-        result = {}
-        if last.loss is not None:
+        # Find the last metric that has a step (skip summary lines without step)
+        last_with_step = None
+        for m in reversed(metrics_list):
+            if m.step is not None:
+                last_with_step = m
+                break
+        last = metrics_list[-1]  # May have train_loss from summary
+
+        result = {"max_steps": max_steps}
+        # Use summary loss if available, otherwise last step loss
+        if last.loss is not None and last.step is None:
             result["final_loss"] = last.loss
-        if last.step is not None:
-            result["final_step"] = last.step
+        elif last_with_step and last_with_step.loss is not None:
+            result["final_loss"] = last_with_step.loss
+        if last_with_step and last_with_step.step is not None:
+            result["final_step"] = last_with_step.step
         if last.eval_loss is not None:
             result["final_eval_loss"] = last.eval_loss
         if last.throughput is not None:

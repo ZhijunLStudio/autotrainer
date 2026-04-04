@@ -41,6 +41,9 @@ class EvalManager:
     Inference verification samples predictions to check quality beyond metrics.
     """
 
+    # Python binary for the PaddlePaddle conda environment
+    _PADDLE_PYTHON = "/data/lizhijun/anaconda3/envs/paddle/bin/python3"
+
     def __init__(self, paddleformers_root: str, work_dir: str):
         self.pf_root = paddleformers_root
         self.work_dir = work_dir
@@ -63,7 +66,9 @@ class EvalManager:
         )
 
         cmd = [
-            "paddleformers-cli",
+            self._PADDLE_PYTHON,
+            "-m",
+            "paddleformers.cli.cli",
             "train",
             config_path,
             "--do_eval",

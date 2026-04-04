@@ -93,6 +93,63 @@ class TrainManager:
         self._latest_metrics: LogMetrics | None = None
         self._collected_errors: list[dict] = []
 
+    def run_single_ablation(
+        self,
+        base_config: dict,
+        factor_changes: dict[str, Any],
+        subset_path: str,
+        max_steps: int,
+        experiment_id: str,
+        gpu_ids: list[int] | None = None,
+    ) -> TrainingResult:
+        """Run a single ablation experiment and return the result.
+
+        Used by the intelligent ablation loop in the pipeline.
+        """
+        # Build config
+        exp_config = self.config_builder.build_ablation_config(
+            base=base_config,
+            factor_changes=factor_changes,
+            subset_path=subset_path,
+            max_steps=max_steps,
+        )
+
+        output_dir = os.path.join(self.work_dir, "checkpoints", experiment_id)
+        exp_config["finetuning"]["output_dir"] = output_dir
+
+        # Write config
+        config_path = os.path.join(self.work_dir, "configs", f"{experiment_id}.yaml")
+        self.config_builder.to_yaml(exp_config, config_path)
+
+        # Save experiment record
+        experiment_record = {
+            "id": experiment_id,
+            "phase": "ablation",
+            "config_diff": factor_changes,
+            "config_path": config_path,
+            "data_subset": subset_path,
+            "max_steps": max_steps,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+        }
+        self._save_experiment_record(experiment_record)
+
+        # Run training
+        result = self._run_single(
+            experiment_id=experiment_id,
+            config_path=config_path,
+            output_dir=output_dir,
+            gpu_ids=gpu_ids,
+        )
+
+        # Update record
+        experiment_record["status"] = result.status
+        experiment_record["result"] = result.to_dict()
+        experiment_record["completed_at"] = datetime.now().isoformat()
+        self._save_experiment_record(experiment_record)
+
+        return result
+
     def run_ablation(
         self,
         base_config: dict,
@@ -249,10 +306,21 @@ class TrainManager:
         # Parse final metrics from log
         final_metrics = self.log_parser.extract_final_metrics(log_path)
 
+        # Determine status: completed if exit_code == 0, or if we ran most/all steps
+        # (eval may crash on IterableDataset but training itself succeeded)
+        final_step = final_metrics.get("final_step", 0)
+        expected_steps = final_metrics.get("max_steps", 0)
+        if exit_code == 0:
+            status = "completed"
+        elif final_step > 0 and (expected_steps <= 0 or final_step >= expected_steps * 0.9):
+            status = "completed"  # Training finished, eval may have failed
+        else:
+            status = "failed"
+
         result = TrainingResult(
             experiment_id=experiment_id,
             final_loss=final_metrics.get("final_loss"),
-            total_steps=final_metrics.get("final_step", 0),
+            total_steps=final_step,
             total_time_seconds=elapsed,
             checkpoint_path=output_dir,
             log_path=log_path,
@@ -260,7 +328,7 @@ class TrainManager:
             throughput=final_metrics.get("throughput"),
             metrics=final_metrics,
             errors=self._collected_errors,
-            status="completed" if exit_code == 0 else "failed",
+            status=status,
         )
 
         # Save result
