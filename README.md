@@ -10,9 +10,9 @@ AutoTrainer automates the full ML lifecycle: data processing, environment setup,
 - **3 Skills** (LLM capabilities, called on-demand):
   - `data-inspect` — understands data schema and generates erniekit conversion scripts
   - `diagnose-training` — two-tier error diagnosis (regex fast-path + LLM for complex cases)
-  - `plan-experiment` — ablation strategy, parameter tuning, experiment ranking
+  - `plan-experiment` — intelligent iterative hyperparameter tuning with trend analysis and adaptive search
 - **TUI** — real-time terminal interface with collapsible panels, smart log display, GPU monitoring
-- **Ablation Engine** — single-factor → multi-factor → full training, all on small subsets first
+- **Intelligent Ablation Agent** — per-factor iterative tuning with Pearson correlation trend analysis, adaptive search range narrowing/expansion, convergence detection
 - **Crash Recovery** — WAL-style state persistence, resume from any interrupted phase
 - **Health Watchdog** — GPU monitoring, hang detection, process alive checks
 - **Context Management** — percentage-based token budgets, raw logs never enter LLM context
@@ -172,7 +172,7 @@ autotrainer run --task paddleocr-vl --resume
 Pipeline phases:
 1. **Data Prepare** — validate, profile, split, create 5% ablation subset
 2. **Env Check** — verify PaddlePaddle, packages, GPU (interactive if issues found)
-3. **Ablation** — single-factor experiments on 5% subset, LLM ranks results
+3. **Ablation** — intelligent per-factor iterative tuning on 5% subset: runs experiments, analyzes loss trends with Pearson correlation, narrows/expands search range, converges to best values per factor, then combines into best config
 4. **Full Training** — best config on full data, health watchdog active
 5. **Evaluation** — eval metrics + sample inference verification
 6. **Report** — visualizations and summary
@@ -246,10 +246,11 @@ Two-tier training error diagnosis:
 - **Tier 2** (LLM): complex or unknown errors with full context analysis
 
 ### `plan-experiment`
-LLM-driven experiment planning:
-- Single-factor ablation grid design
-- Ranks results and suggests next experiments
-- Multi-factor combination selection
+Intelligent iterative hyperparameter tuning:
+- Per-factor ablation with Pearson correlation trend analysis
+- Adaptive search range: narrows around best value (concave trend) or expands (monotonic trend)
+- Automatic convergence detection (<5% improvement between rounds)
+- Combines best values across all factors for final training config
 
 ---
 
