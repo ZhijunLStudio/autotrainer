@@ -85,6 +85,50 @@ def status(work_dir: str | None):
 
 
 @cli.command()
+@click.option("--data-dir", "data_dir", type=str, default="",
+              help="Directory produced by `autotrainer data` (contains data_index.json)")
+@click.option("--data-path", "data_path", type=str, default="",
+              help="Existing JSONL path to use directly")
+@click.option("--task", type=click.Choice(["paddleocr-vl"]), default="paddleocr-vl", show_default=True,
+              help="Task type")
+@click.option("--gpus", type=str, default=None,
+              help='GPU IDs, e.g. "0,1,2,3" or "all"')
+@click.option("--skip-ablation", is_flag=True, default=False,
+              help="Skip ablation experiments and go straight to full training")
+@click.option("--goal", type=str, default="",
+              help="Training goal description")
+@click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint")
+@click.option("--no-tui", is_flag=True, default=False, help="Headless mode (no TUI)")
+def train(data_dir: str, data_path: str, task: str, gpus: str | None,
+          skip_ablation: bool, goal: str, resume: bool, no_tui: bool):
+    """Launch training pipeline from processed data.
+
+    \b
+    Most common usage:
+      # Step 1 — process raw data
+      autotrainer data --path /data/arabic_ocr/ --output-dir ./autotrainer_output
+
+      # Step 2 — train
+      autotrainer train --data-dir ./autotrainer_output --task paddleocr-vl --gpus 0,1
+
+    \b
+    Or skip to full training with an existing JSONL:
+      autotrainer train --data-path /data/train.jsonl --skip-ablation
+    """
+    from autotrainer.cli.train_cmd import train_command
+    train_command(
+        data_dir=data_dir,
+        data_path=data_path,
+        task=task,
+        gpus=gpus,
+        skip_ablation=skip_ablation,
+        goal=goal,
+        resume=resume,
+        no_tui=no_tui,
+    )
+
+
+@cli.command()
 @click.option("--work-dir", type=str, default=None, help="Work directory to resume from")
 def resume(work_dir: str | None):
     """Resume a previously interrupted training pipeline."""

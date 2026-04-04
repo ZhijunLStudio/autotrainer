@@ -19,6 +19,7 @@ from autotrainer.config import AutoTrainerConfig
 from autotrainer.context.store import ContextStore
 from autotrainer.context.summarizer import LogSummarizer
 from autotrainer.managers.data_manager import DataManager
+from autotrainer.managers.data_pipeline import DataPipeline
 from autotrainer.managers.env_manager import EnvManager
 from autotrainer.managers.eval_manager import EvalManager
 from autotrainer.managers.train_manager import TrainManager, TrainingResult
@@ -82,10 +83,12 @@ class PipelineOrchestrator:
         task: str = "paddleocr-vl",
         gpu_ids: list[int] | None = None,
         resume: bool = False,
+        data_dir: str = "",
     ):
         self.config = config
         self.task = task
         self.gpu_ids = gpu_ids or list(range(config.detect_gpu_count()))
+        self.data_dir = data_dir  # autotrainer data output dir (contains data_index.json)
 
         # Work directory
         self.work_dir = os.path.join(config.work_dir, f"{task}-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
@@ -103,6 +106,7 @@ class PipelineOrchestrator:
         # Managers
         self.env_mgr = EnvManager(paddleformers_root=config.paddleformers_root)
         self.data_mgr = DataManager(cache_dir=os.path.join(self.work_dir, "data"), paddleformers_root=config.paddleformers_root)
+        self.data_pipeline = DataPipeline(cache_dir=os.path.join(self.work_dir, "data"))
         self.train_mgr = TrainManager(paddleformers_root=config.paddleformers_root, work_dir=self.work_dir)
         self.eval_mgr = EvalManager(paddleformers_root=config.paddleformers_root, work_dir=self.work_dir)
         self.config_builder = ConfigBuilder()
@@ -244,63 +248,106 @@ class PipelineOrchestrator:
     # ════════════════════════════════════════════════════════════
 
     def _run_phase_data_prepare(self):
-        """Phase 1: Validate, profile, and prepare training data."""
+        """Phase 1: Validate, profile, and prepare training data.
+
+        Two code paths:
+        A) data_dir contains data_index.json (output of `autotrainer data`)
+           → merge all completed datasets' train/val into merged_train/val.jsonl
+        B) data_path is an existing JSONL/directory
+           → validate + profile + split as before
+        """
         if self.phase_mgr.is_completed(Phase.DATA_PREPARE):
             self._notify("DATA_PREPARE", "Skipped (already completed)")
             return
 
         self.phase_mgr.transition_to(Phase.DATA_PREPARE)
-        self._notify("DATA_PREPARE", "Validating and profiling data...")
+        self._notify("DATA_PREPARE", "Preparing training data...")
 
-        data_path = self.state.data_path
-        if not data_path or not os.path.exists(data_path):
-            # Try data intelligence
-            result = self.data_intel_skill.handle_discover_mode(self.task)
-            self._notify("DATA_PREPARE", f"Data not found. Use `autotrainer data` to prepare data first.")
-            raise RuntimeError("No training data found. Run `autotrainer data --mode discover --task <task>` first.")
+        # ── Path A: data_dir with data_index.json ─────────────
+        effective_data_dir = self.data_dir or (
+            self.state.data_path
+            if self.state.data_path and os.path.isdir(self.state.data_path)
+            else ""
+        )
+        index_path = os.path.join(effective_data_dir, "data_index.json") if effective_data_dir else ""
 
-        # Validate
-        validation = self.data_mgr.validate_dataset(data_path)
-        if not validation["valid"]:
-            error_msg = "\n".join(validation["errors"][:5])
-            if not self._confirm(f"Data validation failed:\n{error_msg}\nContinue anyway?"):
-                raise RuntimeError("Data validation failed, user aborted.")
+        if index_path and os.path.exists(index_path):
+            self._notify("DATA_PREPARE", f"Reading DataAgent output from {effective_data_dir} ...")
+            try:
+                merge_result = self.data_pipeline.merge_from_index(
+                    data_dir=effective_data_dir,
+                    output_dir=os.path.join(self.work_dir, "data"),
+                )
+            except (FileNotFoundError, RuntimeError) as e:
+                raise RuntimeError(str(e))
 
-        # Profile
-        profile = self.data_mgr.profile_dataset(data_path)
-        self.state.data_profile = profile.to_dict()
-
-        # Set data context
-        self.context.set_data_profile(profile.to_dict())
-
-        # Split if no eval data
-        if not self.state.eval_data_path:
-            split_result = self.data_mgr.split_dataset(
-                data_path,
-                train_ratio=0.9,
-                val_ratio=0.05,
-            )
-            self.state.data_path = split_result["train"]["path"]
-            self.state.eval_data_path = split_result["val"]["path"]
             self._notify(
                 "DATA_PREPARE",
-                f"Split data: train={split_result['train']['count']}, "
-                f"val={split_result['val']['count']}, test={split_result['test']['count']}",
+                f"Merged {len(merge_result['datasets'])} datasets: "
+                f"train={merge_result['total_train']} rows, val={merge_result['total_val']} rows",
             )
+            for ds in merge_result["datasets"]:
+                self._notify(
+                    "DATA_PREPARE",
+                    f"  {ds['name']}: train={ds['train_count']} val={ds['val_count']}",
+                )
 
-        # Create ablation subset (5%)
+            self.state.data_path = merge_result["train"]["path"]
+            self.state.eval_data_path = merge_result["val"]["path"] if merge_result["val"]["count"] > 0 else ""
+
+            # Profile the merged train file
+            profile = self.data_mgr.profile_dataset(self.state.data_path)
+            self.state.data_profile = profile.to_dict()
+            self.context.set_data_profile(profile.to_dict())
+
+        # ── Path B: explicit JSONL / directory ────────────────
+        else:
+            data_path = self.state.data_path
+            if not data_path or not os.path.exists(data_path):
+                raise RuntimeError(
+                    "No training data found.\n"
+                    "  Option 1: run `autotrainer data --path <dataset_dir>` first, "
+                    "then `autotrainer train --data-dir <output_dir>`\n"
+                    "  Option 2: pass an existing JSONL: `autotrainer train --data-path <file.jsonl>`"
+                )
+
+            # Validate
+            validation = self.data_mgr.validate_dataset(data_path)
+            if not validation["valid"]:
+                error_msg = "\n".join(validation["errors"][:5])
+                if not self._confirm(f"Data validation failed:\n{error_msg}\nContinue anyway?"):
+                    raise RuntimeError("Data validation failed, user aborted.")
+
+            # Profile
+            profile = self.data_mgr.profile_dataset(data_path)
+            self.state.data_profile = profile.to_dict()
+            self.context.set_data_profile(profile.to_dict())
+
+            # Split if no eval data provided
+            if not self.state.eval_data_path:
+                split_result = self.data_mgr.split_dataset(data_path, train_ratio=0.9, val_ratio=0.05)
+                self.state.data_path = split_result["train"]["path"]
+                self.state.eval_data_path = split_result["val"]["path"]
+                self._notify(
+                    "DATA_PREPARE",
+                    f"Split: train={split_result['train']['count']}, "
+                    f"val={split_result['val']['count']}, test={split_result['test']['count']}",
+                )
+
+        # ── Ablation subset (5%) ──────────────────────────────
         ablation_data_dir = os.path.join(self.work_dir, "data")
         ensure_dir(ablation_data_dir)
         ablation_subset_path = os.path.join(ablation_data_dir, "subset_5pct.jsonl")
-        subset_info = self.data_mgr.create_subset(
-            self.state.data_path,
-            ablation_subset_path,
-            ratio=0.05,
-        )
+        subset_info = self.data_mgr.create_subset(self.state.data_path, ablation_subset_path, ratio=0.05)
         self.state.ablation_config = {"subset_path": ablation_subset_path, "subset_info": subset_info}
 
         self._save_recovery_state()
-        self._notify("DATA_PREPARE", f"Data ready: {profile.num_samples} samples, {profile.format} format")
+        profile_dict = self.state.data_profile
+        self._notify(
+            "DATA_PREPARE",
+            f"Data ready: {profile_dict.get('num_samples', '?')} samples, "
+            f"format={profile_dict.get('format', '?')}",
+        )
 
     # ════════════════════════════════════════════════════════════
     # Phase 2: Environment Check
@@ -358,22 +405,32 @@ class PipelineOrchestrator:
     # ════════════════════════════════════════════════════════════
 
     def _run_phase_ablation(self):
-        """Phase 3: Run ablation experiments on 5% data subset.
+        """Phase 3: Intelligent iterative ablation on 5% data subset.
 
-        Three sub-phases:
-        A. Single-factor: lr, bs, lora_rank (each 500-1000 steps)
-        B. Multi-factor: top 2-3 combinations from A
-        C. Rank and select best for full training
+        For each factor sequentially:
+          1. Run initial experiments (3-4 values)
+          2. Analyze loss trend
+          3. Refine search range (up to 2 more rounds)
+          4. Pick best value, bake into running config for next factor
+        Combine all best values into final ablation config.
         """
+        import copy
+
         if self.phase_mgr.is_completed(Phase.ABLATION):
             self._notify("ABLATION", "Skipped (already completed)")
+            return
+
+        state = self.phase_mgr.get_phase_state(Phase.ABLATION)
+        if state.get("status") == "skipped":
+            self._notify("ABLATION", "Skipped (skip-ablation)")
             return
 
         self.phase_mgr.transition_to(Phase.ABLATION)
 
         # Build base config
+        model_path = self.config.detect_model_path("PaddlePaddle/PaddleOCR-VL")
         base_config = self.config_builder.build_paddleocr_vl_config(
-            model_path="PaddlePaddle/PaddleOCR-VL",
+            model_path=model_path,
             train_data=self.state.data_path,
             eval_data=self.state.eval_data_path,
             lora=True,
@@ -386,78 +443,141 @@ class PipelineOrchestrator:
             self.state.best_ablation_config = base_config
             return
 
-        # --- Sub-phase A: Single-factor ablation ---
-        self._notify("ABLATION", "Phase A: Single-factor ablation (5% subset, 1000 steps each)")
-        single_factors = {
-            "finetuning.learning_rate": [1e-5, 3e-5, 1e-4, 3e-4],
-            "finetuning.per_device_train_batch_size": [1, 2, 4],
-            "model.lora_rank": [4, 8, 16],
-        }
-
-        ablation_plan = self.plan_skill.plan_ablation(
-            base_config=base_config,
-            factors=single_factors,
-            subset_ratio=0.05,
-            max_steps=1000,
+        # Factor definitions
+        from autotrainer.skills.plan_experiment.handler import (
+            AblationFactorConfig,
+            ExperimentRecord,
         )
 
+        factors = [
+            AblationFactorConfig(
+                dotted_key="finetuning.learning_rate",
+                initial_values=[1e-5, 3e-5, 1e-4, 3e-4],
+                scale="log", discrete=False, min_value=1e-6, max_value=1e-3,
+            ),
+            AblationFactorConfig(
+                dotted_key="finetuning.per_device_train_batch_size",
+                initial_values=[1, 2, 4],
+                scale="linear", discrete=True, min_value=1, max_value=16,
+            ),
+            AblationFactorConfig(
+                dotted_key="model.lora_rank",
+                initial_values=[4, 8, 16],
+                scale="linear", discrete=True, min_value=2, max_value=64,
+            ),
+        ]
+
+        # running_config accumulates best values as we go
+        running_config = copy.deepcopy(base_config)
+        exp_counter = 0
+
+        for factor_config in factors:
+            self._notify("ABLATION", f"=== Tuning {factor_config.dotted_key} ===")
+
+            current_values = list(factor_config.initial_values)
+            factor_history: list[ExperimentRecord] = []
+            best_value_for_factor = None
+
+            for round_num in range(factor_config.max_rounds):
+                if not current_values:
+                    break
+
+                round_values = current_values[:6]  # safety cap
+                self._notify(
+                    "ABLATION",
+                    f"  Round {round_num + 1}: testing {factor_config.dotted_key} in {round_values}",
+                )
+
+                for value in round_values:
+                    # Skip if we already tested this exact value
+                    already_tested = any(
+                        abs(r.value - value) < 1e-12 and r.status == "completed"
+                        for r in factor_history
+                    )
+                    if already_tested:
+                        continue
+
+                    exp_counter += 1
+                    factor_name = factor_config.dotted_key.split(".")[-1]
+                    exp_id = f"abl-{exp_counter:03d}-{factor_name}={value}"
+
+                    try:
+                        result = self.train_mgr.run_single_ablation(
+                            base_config=running_config,
+                            factor_changes={factor_config.dotted_key: value},
+                            subset_path=subset_path,
+                            max_steps=1000,
+                            experiment_id=exp_id,
+                            gpu_ids=self.gpu_ids,
+                        )
+                    except Exception as e:
+                        self._notify("ABLATION", f"  Experiment {exp_id} crashed: {e}")
+                        record = ExperimentRecord(
+                            id=exp_id, factor=factor_config.dotted_key,
+                            value=value, config_diff={factor_config.dotted_key: value},
+                            status="failed",
+                        )
+                        factor_history.append(record)
+                        self.state.ablation_results.append({
+                            "experiment_id": exp_id, "status": "failed",
+                        })
+                        continue
+
+                    record = ExperimentRecord(
+                        id=exp_id, factor=factor_config.dotted_key,
+                        value=value, config_diff={factor_config.dotted_key: value},
+                        status=result.status,
+                        final_loss=result.final_loss,
+                        eval_loss=result.eval_loss,
+                        log_path=result.log_path,
+                    )
+                    factor_history.append(record)
+                    self.state.ablation_results.append(result.to_dict())
+                    self._notify(
+                        "ABLATION",
+                        f"    {exp_id}: loss={result.final_loss} status={result.status}",
+                    )
+
+                # Analyze after each round
+                analysis = self.plan_skill.analyze_and_suggest(
+                    factor_config=factor_config,
+                    history=factor_history,
+                    round_number=round_num,
+                )
+
+                self._notify("ABLATION", f"  → Analysis: {analysis.analysis}")
+
+                if analysis.action == "done":
+                    best_value_for_factor = analysis.best_value
+                    break
+
+                current_values = analysis.next_values
+                best_value_for_factor = analysis.best_value
+
+            # Apply best value to running_config
+            if best_value_for_factor is not None:
+                parts = factor_config.dotted_key.split(".")
+                target = running_config
+                for p in parts[:-1]:
+                    target = target.setdefault(p, {})
+                target[parts[-1]] = best_value_for_factor
+                self._notify(
+                    "ABLATION",
+                    f"  ✓ Best {factor_config.dotted_key} = {best_value_for_factor}",
+                )
+
+        # Final best config
+        self.state.best_ablation_config = running_config
+        self._save_recovery_state()
+
+        # Log summary
+        lr = running_config.get("finetuning", {}).get("learning_rate", "?")
+        bs = running_config.get("finetuning", {}).get("per_device_train_batch_size", "?")
+        rank = running_config.get("model", {}).get("lora_rank", "?")
         self._notify(
             "ABLATION",
-            f"Planned {ablation_plan['total_runs']} single-factor experiments",
+            f"Ablation complete. Best config: lr={lr}, batch_size={bs}, lora_rank={rank}",
         )
-
-        if not self._confirm(f"Run {ablation_plan['total_runs']} ablation experiments?"):
-            self._notify("ABLATION", "Skipped by user. Using default config.")
-            self.state.best_ablation_config = base_config
-            return
-
-        # Run single-factor experiments
-        single_results = self.train_mgr.run_ablation(
-            base_config=base_config,
-            factors=single_factors,
-            subset_path=subset_path,
-            max_steps=1000,
-            gpu_ids=self.gpu_ids,
-        )
-
-        # Record results
-        for r in single_results:
-            self.state.ablation_results.append(r.to_dict())
-
-        # --- Sub-phase B: Rank and plan multi-factor ---
-        self._notify("ABLATION", "Phase B: Analyzing results, planning multi-factor experiments")
-
-        # Build experiment history for the plan skill
-        history = []
-        for r in single_results:
-            history.append(
-                {
-                    "id": r.experiment_id,
-                    "status": r.status,
-                    "result": r.to_dict(),
-                    "config_diff": {r.experiment_id.split("-")[2]: r.experiment_id.split("=")[1] if "=" in r.experiment_id else ""},
-                }
-            )
-
-        ranking = self.plan_skill.rank_experiments(history)
-
-        if ranking:
-            top_n = ranking[:3]
-            self._notify("ABLATION", f"Top 3 configs from Phase A:")
-            for i, r in enumerate(top_n, 1):
-                self._notify("ABLATION", f"  {i}. {r['id']} — eval_loss={r['eval_loss']}")
-
-            # Pick the best as our full training config
-            best_exp = top_n[0]
-            self._notify("ABLATION", f"Selected best config from: {best_exp['id']}")
-            # Note: In a full implementation, we'd reconstruct the config from best_exp
-            self.state.best_ablation_config = base_config
-        else:
-            self._notify("ABLATION", "No successful ablation results. Using default config.")
-            self.state.best_ablation_config = base_config
-
-        self._save_recovery_state()
-        self._notify("ABLATION", f"Ablation complete. {len(single_results)} experiments run.")
 
     # ════════════════════════════════════════════════════════════
     # Phase 4: Full Training
@@ -474,11 +594,18 @@ class PipelineOrchestrator:
 
         config = self.state.best_ablation_config
         if not config:
+            model_path = self.config.detect_model_path("PaddlePaddle/PaddleOCR-VL")
             config = self.config_builder.build_paddleocr_vl_config(
-                model_path="PaddlePaddle/PaddleOCR-VL",
+                model_path=model_path,
                 train_data=self.state.data_path,
                 eval_data=self.state.eval_data_path,
             )
+
+        # Ensure data paths from DATA_PREPARE phase are injected
+        if self.state.data_path:
+            config["data"]["train_dataset_path"] = self.state.data_path
+        if self.state.eval_data_path:
+            config["data"]["eval_dataset_path"] = self.state.eval_data_path
 
         # Set full training parameters
         config["finetuning"]["output_dir"] = os.path.join(self.work_dir, "checkpoints", "full-training")

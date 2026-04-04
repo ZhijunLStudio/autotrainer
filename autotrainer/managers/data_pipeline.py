@@ -294,16 +294,169 @@ class DataPipeline:
         return parts
 
     # ──────────────────────────────────────────────────────────
+    # Merge DataAgent output into ready-to-train files
+    # ──────────────────────────────────────────────────────────
+
+    def merge_from_index(
+        self,
+        data_dir: str,
+        output_dir: str | None = None,
+    ) -> dict:
+        """Read data_index.json produced by DataAgent and merge all completed
+        datasets' train/val JSONL files into single merged files.
+
+        Returns:
+            {
+              "train": {"path": "...", "count": N},
+              "val":   {"path": "...", "count": N},
+              "datasets": [{"name": ..., "train_count": ..., "val_count": ...}, ...],
+              "total_train": N,
+              "total_val": N,
+            }
+        """
+        index_path = os.path.join(data_dir, "data_index.json")
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(
+                f"data_index.json not found in {data_dir}. "
+                "Run `autotrainer data --path <dataset> --output-dir <dir>` first."
+            )
+
+        with open(index_path, "r", errors="replace") as f:
+            index = json.load(f)
+
+        datasets = [d for d in index.get("datasets", []) if d.get("status") == "completed"]
+        if not datasets:
+            raise RuntimeError(
+                f"No completed datasets found in {index_path}. "
+                "Check that `autotrainer data` ran successfully."
+            )
+
+        out_dir = output_dir or data_dir
+        os.makedirs(out_dir, exist_ok=True)
+        merged_train = os.path.join(out_dir, "merged_train.jsonl")
+        merged_val = os.path.join(out_dir, "merged_val.jsonl")
+
+        train_count = 0
+        val_count = 0
+        dataset_stats = []
+
+        def _rewrite_image_paths(line: str, src_dir: str, out_dir: str) -> str:
+            """Rewrite relative ./images/ paths to absolute paths in a JSONL line."""
+            if "./images/" not in line:
+                return line
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                return line
+            img_info = data.get("image_info")
+            if isinstance(img_info, list):
+                for img in img_info:
+                    if isinstance(img, dict):
+                        url = img.get("image_url", "")
+                        if url.startswith("./images/"):
+                            img["image_url"] = os.path.join(src_dir, url[2:])
+                        elif url.startswith("./"):
+                            img["image_url"] = os.path.join(src_dir, url[2:])
+            return json.dumps(data, ensure_ascii=False) + "\n"
+
+        with open(merged_train, "w", encoding="utf-8") as f_train, \
+             open(merged_val, "w", encoding="utf-8") as f_val:
+
+            for ds in datasets:
+                ds_train_count = 0
+                ds_val_count = 0
+
+                train_path = ds.get("split", {}).get("train", {}).get("path", "")
+                val_path = ds.get("split", {}).get("val", {}).get("path", "")
+
+                if train_path and os.path.exists(train_path):
+                    src_dir = os.path.dirname(train_path)
+
+                    # Symlink images directory into the merged output dir
+                    # (backup for code that resolves relative paths)
+                    source_images_dir = os.path.join(src_dir, "images")
+                    if os.path.isdir(source_images_dir) and not os.path.isdir(os.path.join(out_dir, "images")):
+                        try:
+                            os.symlink(source_images_dir, os.path.join(out_dir, "images"), target_is_directory=True)
+                        except OSError:
+                            pass
+
+                    with open(train_path, "r", errors="replace") as src:
+                        for line in src:
+                            if line.strip():
+                                line = _rewrite_image_paths(line, src_dir, out_dir)
+                                f_train.write(line if line.endswith("\n") else line + "\n")
+                                ds_train_count += 1
+                    train_count += ds_train_count
+
+                if val_path and os.path.exists(val_path):
+                    with open(val_path, "r", errors="replace") as src:
+                        for line in src:
+                            if line.strip():
+                                f_val.write(line if line.endswith("\n") else line + "\n")
+                                ds_val_count += 1
+                    val_count += ds_val_count
+
+                dataset_stats.append({
+                    "name": ds.get("dataset_name", ""),
+                    "train_count": ds_train_count,
+                    "val_count": ds_val_count,
+                    "source": ds.get("source_path", ""),
+                })
+
+        # Remove empty val file if nothing was written
+        if val_count == 0 and os.path.exists(merged_val):
+            os.unlink(merged_val)
+            merged_val = ""
+
+        return {
+            "train": {"path": merged_train, "count": train_count},
+            "val": {"path": merged_val, "count": val_count},
+            "datasets": dataset_stats,
+            "total_train": train_count,
+            "total_val": val_count,
+        }
+
+    # ──────────────────────────────────────────────────────────
     # Subset creation (for ablation)
     # ──────────────────────────────────────────────────────────
 
     def create_subset(self, src: str, dst: str, ratio: float, seed: int = 42) -> dict:
+        """Create a random subset of a JSONL file.
+
+        If the source file contains relative image paths, they are rewritten
+        to absolute paths (relative to the source file's directory) so the
+        subset can be used from any working directory.
+        """
         random.seed(seed)
+        src_dir = os.path.dirname(src)
         with open(src, "r") as f:
             lines = f.readlines()
         subset_size = max(1, int(len(lines) * ratio))
         sampled = random.sample(lines, subset_size)
+
+        # Rewrite relative image paths to absolute
+        rewritten = []
+        for line in sampled:
+            line = line.strip()
+            if not line:
+                continue
+            if "./images/" in line or "./" in line:
+                try:
+                    data = json.loads(line)
+                    img_info = data.get("image_info")
+                    if isinstance(img_info, list):
+                        for img in img_info:
+                            if isinstance(img, dict):
+                                url = img.get("image_url", "")
+                                if url.startswith("./"):
+                                    img["image_url"] = os.path.join(src_dir, url[2:])
+                    line = json.dumps(data, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    pass
+            rewritten.append(line + "\n")
+
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
         with open(dst, "w") as f:
-            f.writelines(sampled)
-        return {"total": len(lines), "subset": len(sampled), "ratio": ratio, "path": dst}
+            f.writelines(rewritten)
+        return {"total": len(lines), "subset": len(rewritten), "ratio": ratio, "path": dst}

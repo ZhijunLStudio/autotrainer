@@ -39,16 +39,19 @@ def _run_cmd(cmd: list[str], timeout: int = 30) -> str:
 
 
 def _get_version(package: str) -> str:
-    """Get version of an installed package via pip show."""
-    out = _run_cmd(["pip", "show", package])
-    for line in out.splitlines():
-        if line.startswith("Version:"):
-            return line.split(":", 1)[1].strip()
-    return ""
+    """Get version of an installed package via importlib.metadata (same Python, no subprocess)."""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return ""
 
 
 class EnvManager:
     """Environment verification and setup."""
+
+    # Python binary for the PaddlePaddle conda environment
+    _PADDLE_PYTHON = "/data/lizhijun/anaconda3/envs/paddle/bin/python3"
 
     # Required packages for PaddleFormers training
     REQUIRED_PACKAGES = [
@@ -62,6 +65,16 @@ class EnvManager:
 
     def __init__(self, paddleformers_root: str = ""):
         self.pf_root = paddleformers_root
+
+    def _get_version_in_paddle_env(self, package: str) -> str:
+        """Get version of a package installed in the paddle conda env."""
+        import subprocess
+        result = subprocess.run(
+            [self._PADDLE_PYTHON, "-c",
+             f"import importlib.metadata; print(importlib.metadata.version('{package}'))"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
 
     def check_environment(self) -> EnvStatus:
         """Run a comprehensive environment check."""
@@ -86,21 +99,18 @@ class EnvManager:
         if cuda_out:
             status.cuda_version = cuda_out.splitlines()[0] if cuda_out.splitlines() else ""
 
-        # PaddlePaddle
-        status.paddle_version = _get_version("paddlepaddle-gpu") or _get_version("paddlepaddle")
+        # PaddlePaddle — check in paddle conda env
+        status.paddle_version = self._get_version_in_paddle_env("paddlepaddle-gpu") or self._get_version_in_paddle_env("paddlepaddle")
         if not status.paddle_version:
             status.issues.append("PaddlePaddle not installed")
             status.suggestions.append("pip install paddlepaddle-gpu")
 
-        # PaddleFormers
-        if self.pf_root:
-            pf_version_path = os.path.join(self.pf_root, "setup.py")
-            if os.path.exists(pf_version_path):
+        # PaddleFormers — check in paddle conda env
+        status.paddleformers_version = self._get_version_in_paddle_env("paddleformers")
+        if not status.paddleformers_version:
+            # Fallback: check local source
+            if self.pf_root and os.path.exists(os.path.join(self.pf_root, "setup.py")):
                 status.paddleformers_version = "local"
-            else:
-                status.paddleformers_version = _get_version("paddleformers")
-        else:
-            status.paddleformers_version = _get_version("paddleformers")
 
         if not status.paddleformers_version:
             status.issues.append("PaddleFormers not installed")
@@ -109,9 +119,9 @@ class EnvManager:
             else:
                 status.suggestions.append("pip install paddleformers")
 
-        # Required packages
+        # Required packages — check in paddle conda env
         for pkg in self.REQUIRED_PACKAGES:
-            ver = _get_version(pkg)
+            ver = self._get_version_in_paddle_env(pkg)
             status.packages[pkg] = ver
             if not ver:
                 status.issues.append(f"Missing package: {pkg}")

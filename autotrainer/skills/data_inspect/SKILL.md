@@ -113,8 +113,62 @@ def save_image(image_data, image_dir, idx):
     except Exception:
         return None
 
+def save_image_from_path(image_path, image_dir, idx, input_path=None):
+    """Load image from file path, save to image_dir, return relative path.
+
+    Handles Windows-style backslash paths (\\) on Linux automatically.
+    Falls back to normpath + case-insensitive search if direct path fails.
+    """
+    if not image_dir or not image_path:
+        return None
+    try:
+        # Normalize Windows backslashes to forward slashes
+        if isinstance(image_path, str):
+            # Replace backslashes (common in CSV/JSON from Windows)
+            clean_path = image_path.replace("\\", "/")
+            # Also handle .\ prefix -> ./
+            if clean_path.startswith("./") or clean_path.startswith("."):
+                pass  # already clean
+            # Resolve relative to input_path
+            if input_path and not os.path.isabs(clean_path):
+                abs_path = os.path.normpath(os.path.join(input_path, clean_path))
+            else:
+                abs_path = os.path.normpath(clean_path)
+        else:
+            return None
+
+        if not os.path.exists(abs_path):
+            # Try case-insensitive match for stubborn paths
+            if input_path and "/" in str(image_path):
+                parts = str(image_path).replace("\\", "/").split("/")
+                candidate = input_path
+                found = True
+                for part in parts:
+                    if part in (".", ""):
+                        continue
+                    matches = [f for f in os.listdir(candidate) if f.lower() == part.lower()]
+                    if matches:
+                        candidate = os.path.join(candidate, matches[0])
+                    else:
+                        found = False
+                        break
+                if found and os.path.exists(candidate):
+                    abs_path = candidate
+                else:
+                    return None
+            else:
+                return None
+
+        img = PILImage.open(abs_path)
+        fname = f"img_{idx:08d}.png"
+        img.save(os.path.join(image_dir, fname))
+        return f"./images/{fname}"
+    except Exception:
+        return None
+
 # Usage in loop:
-image_path = save_image(row.get("image"), IMAGE_DIR, count)
+# From bytes: image_path = save_image(row.get("image"), IMAGE_DIR, count)
+# From file:  image_path = save_image_from_path(row.get("image_path"), IMAGE_DIR, count, INPUT_PATH)
 image_info = [{"image_url": image_path, "matched_text_index": 0}] if image_path else []
 ```
 

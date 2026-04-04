@@ -7,6 +7,7 @@ Does NOT import PaddleFormers at module level.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Iterator
 
 from autotrainer.utils.subprocess_mgr import SubprocessManager
@@ -15,9 +16,20 @@ from autotrainer.utils.subprocess_mgr import SubprocessManager
 class PaddleFormersLauncher:
     """Launches PaddleFormers training via subprocess."""
 
+    # Default to paddle conda env where paddlepaddle + paddleformers are installed
+    _PADDLE_PYTHON = "/data/lizhijun/anaconda3/envs/paddle/bin/python3"
+
     def __init__(self, paddleformers_root: str, subprocess_mgr: SubprocessManager | None = None):
         self.pf_root = paddleformers_root
         self._mgr = subprocess_mgr or SubprocessManager()
+
+    @staticmethod
+    def _python_bin() -> str:
+        """Return the Python binary path for the PaddlePaddle environment."""
+        import os
+        if os.path.exists(PaddleFormersLauncher._PADDLE_PYTHON):
+            return PaddleFormersLauncher._PADDLE_PYTHON
+        return sys.executable
 
     def _build_command(
         self,
@@ -26,36 +38,42 @@ class PaddleFormersLauncher:
     ) -> list[str]:
         """Build the command to launch paddleformers-cli train.
 
-        For distributed training with paddle.distributed.launch.
+        Uses paddle.distributed.launch to wrap training, which manages
+        the child process lifecycle properly for both single and multi GPU.
         """
+        python = self._python_bin()
+
+        # Use the pip-installed package path in the paddle conda env
+        import subprocess
+        result = subprocess.run(
+            [python, "-c", "import paddleformers.cli.launcher; print(paddleformers.cli.launcher.__file__)"],
+            capture_output=True, text=True,
+        )
+        pf_launcher_path = result.stdout.strip().split("\n")[-1]
+
         if gpu_ids and len(gpu_ids) > 1:
-            # Distributed launch
             gpu_str = ",".join(str(g) for g in gpu_ids)
-            return [
-                "python",
-                "-m",
-                "paddle.distributed.launch",
-                "--gpus",
-                gpu_str,
-                os.path.join(self.pf_root, "paddleformers", "cli", "launcher.py"),
-                "train",
-                config_path,
-            ]
         else:
-            # Single GPU
-            return [
-                "paddleformers-cli",
-                "train",
-                config_path,
-            ]
+            gpu_str = ",".join(str(g) for g in (gpu_ids or [0]))
+
+        return [
+            python,
+            "-m",
+            "paddle.distributed.launch",
+            "--gpus",
+            gpu_str,
+            "--log_dir",
+            "/tmp/paddle_distributed_logs",
+            pf_launcher_path,
+            "train",
+            config_path,
+        ]
 
     def build_env(self, gpu_ids: list[int] | None = None) -> dict[str, str]:
         """Build environment variables for the training subprocess."""
-        env = {}
-        if gpu_ids:
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-        env["PYTHONPATH"] = self.pf_root
-        return env
+        # Don't set PYTHONPATH — use pip-installed paddleformers package directly.
+        # Setting PYTHONPATH to pf_root causes import conflicts with site-packages.
+        return {}
 
     def launch_training(
         self,

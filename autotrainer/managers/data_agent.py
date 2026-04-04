@@ -31,10 +31,24 @@ from autotrainer.pf_integration.dataset_validator import DatasetValidator
 from autotrainer.utils.file_utils import atomic_write_json, safe_read_json
 
 
+def _count_tokens(messages: list[dict]) -> int:
+    """Count tokens in a messages list using tiktoken (cl100k_base).
+
+    Falls back to character-based estimate if tiktoken is unavailable.
+    """
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return sum(len(enc.encode(m.get("content", ""))) for m in messages)
+    except Exception:
+        return sum(len(m.get("content", "")) // 4 for m in messages)
+
+
 MAX_REACT_STEPS = 15     # max exploration steps per dataset
 MAX_RETRY_SCRIPT = 3     # max times to retry fixing the script
 MAX_CMD_OUTPUT = 3000    # truncate command output to this length for context
 MAX_LOOP_REPEAT = 3      # if same thought appears this many times, force final_script
+MAX_HISTORY_TOKENS = 28000  # trim react message history when total tokens exceed this
 
 TIMEOUT_PER_GB = 300     # seconds of sandbox timeout per GB of input data
 TIMEOUT_BASE = 120       # minimum timeout regardless of size
@@ -308,6 +322,43 @@ class DataAgent:
         result.raw_jsonl_path = jsonl_path
         n_imgs = sum(1 for _ in Path(image_dir).glob("*.png")) if Path(image_dir).exists() else 0
         _step_end(f"{sandbox_result.output_rows} rows")
+
+        # ── Image post-validation ──────────────────────────────
+        # If the source has image data but output has no image_info, the script
+        # silently dropped images. Detect this and retry with a fixed script.
+        image_drop_error = self._check_image_drop(source_path, jsonl_path)
+        if image_drop_error and self.llm:
+            click.echo(f"  [WARN] {image_drop_error}")
+            click.echo(f"  Retrying with image-aware script...")
+            _n(DPhase.GENERATING, "image_info empty — regenerating script with image extraction")
+            fix_prompt = (
+                f"{image_drop_error}\n"
+                f"The source data has image bytes. You MUST extract them and populate image_info.\n"
+                f"Use save_image() for bytes or save_image_from_path() for file paths.\n"
+                f"CRITICAL: If loading from file paths, ALWAYS use save_image_from_path() which handles "
+                f"Windows backslash paths (e.g. '.\\\\folder\\\\file.jpg') automatically.\n"
+                f"Check all possible image column names: 'image', 'image.bytes', 'img', 'bytes', "
+                f"'image_bytes', 'Image', 'Image Path', 'image_path', 'file_name', 'path'.\n"
+                f"If the CSV uses Windows paths with backslashes, use save_image_from_path() NOT os.path.join()."
+            )
+            script = self._fix_script_sync(script, fix_prompt, source_path)
+            with open(script_path, "w") as f:
+                f.write(script)
+            # Re-run with fixed script
+            script, sandbox_result, extra_attempts = self._run_with_retry(
+                script, source_path, jsonl_path, image_dir=image_dir, notify=notify
+            )
+            result.script_attempts += extra_attempts
+            with open(script_path, "w") as f:
+                f.write(script)
+            if not sandbox_result.success or sandbox_result.output_rows == 0:
+                result.status = "failed"
+                result.errors.append("Script failed after image-fix retry")
+                result.completed_at = datetime.now().isoformat()
+                _n(DPhase.FAILED, "failed after image-fix retry")
+                return result
+            n_imgs = sum(1 for _ in Path(image_dir).glob("*.png")) if Path(image_dir).exists() else 0
+
         _n(DPhase.CLEANING, f"{sandbox_result.output_rows} rows converted")
 
         # ── Phase 3: Standard post-processing ─────────────────
@@ -416,6 +467,13 @@ class DataAgent:
                 continue
 
             messages.append({"role": "assistant", "content": response_text})
+
+            # ── History trimming — keep total tokens under MAX_HISTORY_TOKENS ──
+            # Always keep the first user message (dataset context) and trim
+            # old observations from the middle when history grows too large.
+            if _count_tokens(messages) > MAX_HISTORY_TOKENS and len(messages) > 4:
+                trimmed_note = {"role": "user", "content": "[Earlier exploration steps trimmed to save context]"}
+                messages = [messages[0], trimmed_note] + messages[-4:]
 
             act_type = action.get("action", "")
             thought = action.get("thought", "")
@@ -740,9 +798,10 @@ _os.unlink(_tmp_path)
                 click.echo(f" timeout even on 100 rows — script has fundamental performance issue")
                 error = (
                     f"Script timed out on just {QUICK_VALIDATE_ROWS} rows (60s limit). "
-                    f"This usually means: 1) PIL image saving is too slow — skip saving images in the script, "
-                    f"just use image_info=[] instead; 2) The loop has an unexpected infinite loop; "
-                    f"3) pandas operations are inefficient. Simplify the script significantly."
+                    f"Causes: 1) Inefficient loop — use df.itertuples() instead of df.iterrows() for 5x speedup; "
+                    f"2) PIL image decode is too slow — save only the first image per row, skip corrupted ones with try/except; "
+                    f"3) Unexpected infinite loop. "
+                    f"IMPORTANT: Do NOT remove image saving. If the source data has image bytes, you MUST save them and populate image_info."
                 )
                 if self.llm:
                     script = self._fix_script_sync(script, error, source_path)
@@ -794,9 +853,11 @@ _os.unlink(_tmp_path)
                 error = (
                     f"Script timed out after {full_timeout}s on {size_gb:.1f}GB dataset.\n"
                     f"Processed rows before timeout: {result.output_rows}.\n"
-                    f"Fix: 1) Skip PIL image saving (use image_info=[]) to reduce IO. "
-                    f"2) Process fewer parquet files (e.g. only first 2). "
-                    f"3) Use df.itertuples() instead of df.iterrows() for 3-5x speedup."
+                    f"Fix: 1) Use df.itertuples() instead of df.iterrows() for 3-5x speedup. "
+                    f"2) Reduce PIL image quality: img.save(..., optimize=False) or save as JPEG. "
+                    f"3) Process parquet files sequentially one at a time. "
+                    f"IMPORTANT: Do NOT use image_info=[] or skip image saving. "
+                    f"If the source data has image bytes, image_info MUST be populated."
                 )
                 click.echo(f" timeout ({result.output_rows} rows before cutoff)")
                 if self.llm and attempt < MAX_RETRY_SCRIPT:
@@ -961,21 +1022,186 @@ print(f"Converted: {count} samples")
 '''
 
     # ══════════════════════════════════════════════════════════
+    # Image drop detection
+    # ══════════════════════════════════════════════════════════
+
+    def _check_image_drop(self, source_path: str, jsonl_path: str) -> str:
+        """Detect if the source data has images but the output JSONL has empty image_info.
+
+        Returns an error string if images were silently dropped, otherwise empty string.
+        """
+        if not os.path.exists(jsonl_path):
+            return ""
+
+        # Check if source likely contains image data
+        source_has_images = self._source_likely_has_images(source_path)
+        if not source_has_images:
+            return ""
+
+        # Sample up to 50 rows from output to see if image_info is populated
+        rows_checked = 0
+        rows_with_images = 0
+        try:
+            with open(jsonl_path, "r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        import json as _json
+                        data = _json.loads(line)
+                    except Exception:
+                        continue
+                    rows_checked += 1
+                    img_info = data.get("image_info", [])
+                    if isinstance(img_info, list) and len(img_info) > 0:
+                        rows_with_images += 1
+                    if rows_checked >= 50:
+                        break
+        except OSError:
+            return ""
+
+        if rows_checked == 0:
+            return ""
+
+        # If less than 10% of rows have image_info, consider it dropped
+        fill_rate = rows_with_images / rows_checked
+        if fill_rate < 0.1:
+            return (
+                f"Image data detected in source but only {rows_with_images}/{rows_checked} "
+                f"output rows have non-empty image_info (fill_rate={fill_rate:.0%}). "
+                f"The conversion script silently dropped image bytes."
+            )
+        return ""
+
+    def _source_likely_has_images(self, source_path: str) -> bool:
+        """Heuristically check if the source dataset contains image data."""
+        path = Path(source_path)
+
+        # Check for image files in directory
+        if path.is_dir():
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp", "*.gif", "*.tif", "*.tiff"):
+                if any(path.rglob(ext)):
+                    return True
+            # Check CSV/TSV files for image path columns
+            for ext in ("*.csv", "*.tsv"):
+                for csv_file in list(path.rglob(ext))[:3]:
+                    if self._csv_references_images(str(csv_file)):
+                        return True
+            # Check parquet columns for image bytes
+            parquet_files = list(path.rglob("*.parquet"))[:2]
+            for pf in parquet_files:
+                if self._parquet_has_image_columns(str(pf)):
+                    return True
+            return False
+
+        # Single file
+        suffix = path.suffix.lower()
+        if suffix == ".parquet":
+            return self._parquet_has_image_columns(str(path))
+        if suffix in (".jsonl", ".json"):
+            return self._jsonl_has_image_data(str(path))
+        return False
+
+    def _parquet_has_image_columns(self, parquet_path: str) -> bool:
+        """Check if a parquet file has columns that look like image data."""
+        image_col_names = {"image", "img", "image_bytes", "bytes", "pixel_values", "image_data"}
+
+        # Try pyarrow first, then fall back to fastparquet for broken parquet files
+        for engine in ("pyarrow", "fastparquet"):
+            try:
+                import pandas as pd
+                df = pd.read_parquet(parquet_path, nrows=1, engine=engine)
+                cols_lower = {c.lower() for c in df.columns}
+                if bool(cols_lower & image_col_names):
+                    return True
+            except Exception:
+                continue
+
+        # Last resort: read schema from pyarrow directly without loading data
+        try:
+            import pyarrow.parquet as pq
+            schema = pq.read_schema(parquet_path)
+            cols_lower = {c.lower() for c in schema.names}
+            return bool(cols_lower & image_col_names)
+        except Exception:
+            return False
+
+    def _csv_references_images(self, csv_path: str) -> bool:
+        """Check if a CSV file has columns that reference image file paths."""
+        image_col_hints = {"image", "img", "image_path", "file_name", "path", "filename", "photo", "image url"}
+        img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
+        try:
+            with open(csv_path, "r", errors="replace") as f:
+                # Read header
+                header_line = f.readline().strip().lower()
+                if any(hint in header_line for hint in image_col_hints):
+                    return True
+                # Sample a few rows for image extensions
+                for i, line in enumerate(f):
+                    if i >= 5:
+                        break
+                    if any(ext in line.lower() for ext in img_exts):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _jsonl_has_image_data(self, jsonl_path: str) -> bool:
+        """Check first few rows of a JSONL for image-related fields."""
+        try:
+            import json as _json
+            with open(jsonl_path, "r", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i >= 5:
+                        break
+                    try:
+                        data = _json.loads(line.strip())
+                        if any(k in data for k in ("image", "img", "image_bytes", "image_url")):
+                            return True
+                    except Exception:
+                        continue
+        except OSError:
+            pass
+        return False
+
+    # ══════════════════════════════════════════════════════════
     # Persistence and summary
     # ══════════════════════════════════════════════════════════
 
     def _save_result(self, result: DatasetResult):
+        """Persist one dataset result to data_index.json under a single filelock
+        so concurrent workers don't overwrite each other's entries."""
+        import filelock
+
         index_path = os.path.join(self.work_dir, "data_index.json")
-        index = safe_read_json(index_path) or {"datasets": []}
-        existing = {d["source_path"] for d in index.get("datasets", [])}
-        if result.source_path in existing:
-            for i, d in enumerate(index["datasets"]):
-                if d["source_path"] == result.source_path:
-                    index["datasets"][i] = result.to_record()
-                    break
-        else:
-            index["datasets"].append(result.to_record())
-        atomic_write_json(index_path, index)
+        lock_path = index_path + ".lock"
+        with filelock.FileLock(lock_path, timeout=30):
+            # Read inside the lock so we see any writes from other workers
+            index = safe_read_json(index_path) or {"datasets": []}
+            existing = {d["source_path"] for d in index.get("datasets", [])}
+            if result.source_path in existing:
+                for i, d in enumerate(index["datasets"]):
+                    if d["source_path"] == result.source_path:
+                        index["datasets"][i] = result.to_record()
+                        break
+            else:
+                index["datasets"].append(result.to_record())
+            # Write directly (no extra lock inside atomic_write_json for same file)
+            import tempfile
+            dir_name = os.path.dirname(index_path)
+            os.makedirs(dir_name, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            try:
+                import json as _json
+                with os.fdopen(fd, "w") as f:
+                    _json.dump(index, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                os.replace(tmp_path, index_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
     def _print_summary(self, results: list[DatasetResult]):
         from rich.console import Console

@@ -132,6 +132,25 @@ class AutoTrainerConfig:
         return ""
 
     @staticmethod
+    def detect_model_path(model_id: str) -> str:
+        """Resolve model path: check local cache first, fall back to HF ID.
+
+        Checks common cache locations before returning the HF hub ID so
+        we avoid network calls when the model is already downloaded.
+        """
+        local_path = Path(f"/data-ssd/lizhijun/models/{model_id}")
+        if (local_path / "config.json").exists():
+            return str(local_path)
+
+        hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+        for suffix in (model_id, model_id.replace("/", "--")):
+            candidate = hf_cache / suffix
+            if (candidate / "config.json").exists():
+                return str(candidate)
+
+        return model_id
+
+    @staticmethod
     def detect_gpu_count() -> int:
         """Detect number of available NVIDIA GPUs."""
         import subprocess

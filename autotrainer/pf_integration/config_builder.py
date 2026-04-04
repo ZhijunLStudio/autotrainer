@@ -19,7 +19,7 @@ _PADDLEOCR_VL_DEFAULTS = {
     "model": {
         "model_name_or_path": "PaddlePaddle/PaddleOCR-VL",
         "stage": "VL-SFT",
-        "attention_implementation": "flash_attention_2",
+        "_attn_implementation": "flashmask",
         "use_lora": False,
         "lora_rank": 8,
         "lora_alpha": 16,
@@ -28,14 +28,20 @@ _PADDLEOCR_VL_DEFAULTS = {
     "data": {
         "dataset_type": "erniekit",
         "train_dataset_path": "",
+        "train_dataset_prob": "1.0",
         "eval_dataset_path": "",
+        "eval_dataset_prob": "1.0",
         "max_seq_len": 8192,
-        "template": "qwen2_vl",
+        "template": "paddleocr_vl",
         "packing": False,
+        "mix_strategy": "concat",
+        "template_backend": "custom",
     },
     "finetuning": {
         "output_dir": "",
         "overwrite_output_dir": True,
+        "do_train": True,
+        "do_eval": True,
         "per_device_train_batch_size": 2,
         "per_device_eval_batch_size": 2,
         "gradient_accumulation_steps": 4,
@@ -45,10 +51,22 @@ _PADDLEOCR_VL_DEFAULTS = {
         "warmup_ratio": 0.1,
         "weight_decay": 0.01,
         "bf16": True,
+        "fp16_opt_level": "O2",
+        "seed": 23,
         "logging_steps": 10,
         "save_steps": 500,
         "eval_steps": 500,
+        "evaluation_strategy": "steps",
+        "save_strategy": "steps",
         "save_total_limit": 3,
+        "logging_dir": "./vdl_log",
+        "sharding": "stage1",
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "recompute_granularity": "full",
+        "recompute_method": "uniform",
+        "recompute_num_layers": 1,
+        "freeze_config": "freeze_vision freeze_aligner",
     },
 }
 
@@ -90,7 +108,7 @@ class ConfigBuilder:
         eval_data_path: str = "",
         data_type: str = "erniekit",
         stage: str = "VL-SFT",
-        template: str = "qwen2_vl",
+        template: str = "paddleocr_vl",
         output_dir: str = "",
         overrides: dict[str, Any] | None = None,
     ) -> dict:
@@ -136,13 +154,17 @@ class ConfigBuilder:
         else:
             config["model"]["use_lora"] = False
 
-        if freeze_vision or freeze_aligner:
+        # freeze_config is already in defaults, only override if explicitly changed
+        if not freeze_vision or not freeze_aligner:
             freeze_parts = []
             if freeze_vision:
-                freeze_parts.append("vision_model")
+                freeze_parts.append("freeze_vision")
             if freeze_aligner:
-                freeze_parts.append("aligner")
-            config["finetuning"]["freeze_config"] = " ".join(freeze_parts)
+                freeze_parts.append("freeze_aligner")
+            if freeze_parts:
+                config["finetuning"]["freeze_config"] = " ".join(freeze_parts)
+            else:
+                config["finetuning"].pop("freeze_config", None)
 
         if overrides:
             config = self.merge_configs(config, overrides)
@@ -157,25 +179,68 @@ class ConfigBuilder:
         max_steps: int = 1000,
         output_dir: str = "",
     ) -> dict:
-        """Build an ablation experiment config from a base + changes."""
-        config = self.merge_configs(base, factor_changes)
+        """Build an ablation experiment config from a base + changes.
+
+        Supports dotted keys like "finetuning.learning_rate" → nested update.
+        """
+        import copy
+
+        config = copy.deepcopy(base)
+        for dotted_key, value in factor_changes.items():
+            parts = dotted_key.split(".")
+            target = config
+            for part in parts[:-1]:
+                if part not in target:
+                    target[part] = {}
+                target = target[part]
+            target[parts[-1]] = value
 
         if subset_path:
             config["data"]["train_dataset_path"] = subset_path
         if output_dir:
             config["finetuning"]["output_dir"] = output_dir
 
-        # Force shorter training for ablation
+        # Force shorter training for ablation — no eval to avoid IterableDataset issues
         config["finetuning"]["max_steps"] = max_steps
         config["finetuning"]["num_train_epochs"] = 1
         config["finetuning"]["save_steps"] = max_steps  # Only save at end
-        config["finetuning"]["eval_steps"] = max(100, max_steps // 5)
+        config["finetuning"]["do_eval"] = False
+        config["finetuning"]["evaluation_strategy"] = "no"
 
         return config
 
+    @staticmethod
+    def _flatten(config: dict) -> dict:
+        """Flatten nested dict (model/data/finetuning -> flat keys).
+
+        PaddleFormers CLI expects a flat YAML, e.g.:
+            model_name_or_path: PaddlePaddle/PaddleOCR-VL
+            train_dataset_path: ...
+            output_dir: ...
+        not nested sections like model.model_name_or_path.
+        Also injects PaddleFormers internal field aliases.
+        """
+        flat: dict = {}
+        for key, value in config.items():
+            if isinstance(value, dict):
+                flat.update(value)
+            else:
+                flat[key] = value
+
+        # PaddleFormers internally reads sub_dataset_type from dataset_type
+        # (mapped to train_dataset_type / eval_dataset_type for SFT dataset)
+        if "dataset_type" in flat:
+            flat.setdefault("train_dataset_type", flat["dataset_type"])
+            flat.setdefault("eval_dataset_type", flat["dataset_type"])
+        # task_group_prob is read per-dataset
+        if "task_group_prob" not in flat:
+            flat["task_group_prob"] = flat.get("train_dataset_prob", "1.0")
+
+        return flat
+
     def to_yaml(self, config: dict, path: str):
         """Write config dict to a YAML file atomically."""
-        content = yaml.dump(config, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        content = yaml.dump(self._flatten(config), default_flow_style=False, allow_unicode=True, sort_keys=False)
         atomic_write_text(path, content)
 
     def from_yaml(self, path: str) -> dict:
