@@ -18,6 +18,7 @@ class EvalResult:
 
     experiment_id: str = ""
     metrics: dict[str, float] = field(default_factory=dict)
+    ocr_metrics: dict[str, Any] = field(default_factory=dict)
     inference_samples: list[dict] = field(default_factory=list)
     report_path: str = ""
     status: str = "completed"
@@ -27,6 +28,7 @@ class EvalResult:
         return {
             "experiment_id": self.experiment_id,
             "metrics": self.metrics,
+            "ocr_metrics": self.ocr_metrics,
             "inference_samples": self.inference_samples,
             "report_path": self.report_path,
             "status": self.status,
@@ -179,6 +181,28 @@ class EvalManager:
             comparison["rankings"] = [{"id": eid, "eval_loss": loss} for eid, loss in scored]
 
         return comparison
+
+    def run_ocr_eval(
+        self,
+        predictions: list[str],
+        references: list[str],
+        pred_htmls: list[str] | None = None,
+        ref_htmls: list[str] | None = None,
+    ) -> dict:
+        """Compute OCR metrics from prediction/reference pairs.
+
+        Call this after inference when you have raw predictions and ground truth.
+        Returns the full metrics dict suitable for storing in EvalResult.ocr_metrics.
+        """
+        from autotrainer.metrics.compute import compute_all_metrics
+
+        metrics = compute_all_metrics(
+            predictions=predictions,
+            references=references,
+            pred_htmls=pred_htmls,
+            ref_htmls=ref_htmls,
+        )
+        return metrics.to_dict()
 
     def _parse_eval_output(self, output: str) -> dict:
         """Parse eval metrics from PaddleFormers stdout."""
