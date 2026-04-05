@@ -30,3 +30,10 @@ def test_has_nan_detection_inf():
     m = parser.parse_line("global_step: 50, loss: inf")
     assert m is not None
     assert m.has_nan is True
+
+def test_has_nan_standalone_returns_non_none():
+    """A line with only 'loss: nan' (no step) should still return non-None."""
+    parser = LogParser()
+    m = parser.parse_line("loss: nan")
+    assert m is not None
+    assert m.has_nan is True

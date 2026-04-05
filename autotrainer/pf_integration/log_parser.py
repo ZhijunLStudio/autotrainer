@@ -131,7 +131,8 @@ class LogParser:
             except ValueError:
                 continue
             if key == "loss":
-                metrics.eval_loss = value
+                if metrics.eval_loss is None:
+                    metrics.eval_loss = value  # Don't overwrite if EVAL_PATTERN already set it
             elif key == "ppl":
                 metrics.eval_ppl = value
             else:
@@ -143,7 +144,8 @@ class LogParser:
 
         # Return None if nothing was extracted
         if (metrics.step is None and metrics.loss is None
-                and metrics.eval_loss is None and not metrics.extra_metrics):
+                and metrics.eval_loss is None and not metrics.extra_metrics
+                and not metrics.has_nan):
             return None
 
         return metrics
