@@ -22,6 +22,7 @@ class LogMetrics:
     throughput: float | None = None
     memory_mb: float | None = None
     epoch: int | None = None
+    grad_norm: float | None = None
     raw_line: str = ""
 
 
@@ -46,6 +47,7 @@ class LogParser:
     SPEED_PATTERN = re.compile(r"(?:throughput|speed)[:\s]+([\d.]+)\s*tokens/s")
     EVAL_PATTERN = re.compile(r"eval[_\s].*?loss[:\s]+(\d+\.\d+)")
     EPOCH_PATTERN = re.compile(r"epoch[:\s]+(\d+)")
+    GRAD_NORM_PATTERN = re.compile(r"grad_norm[=:]\s*([\d.]+(?:[eE][+-]?\d+)?)")
 
     # Error patterns
     OOM_PATTERNS = [
@@ -107,6 +109,14 @@ class LogParser:
         m = self.EPOCH_PATTERN.search(line)
         if m:
             metrics.epoch = int(m.group(1))
+
+        # Parse grad_norm
+        grad_match = self.GRAD_NORM_PATTERN.search(line)
+        if grad_match:
+            try:
+                metrics.grad_norm = float(grad_match.group(1))
+            except ValueError:
+                pass
 
         # Return None if nothing was extracted
         if metrics.step is None and metrics.loss is None and metrics.eval_loss is None:
