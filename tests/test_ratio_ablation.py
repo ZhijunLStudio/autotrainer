@@ -59,3 +59,32 @@ def test_compute_score_with_nan():
     result_no_nan = {"eval_loss": 0.5, "throughput": 1200, "has_nan": False}
     score_no_nan = handler.compute_score(result_no_nan, baseline)
     assert score_nan < score_no_nan  # NaN penalty
+
+
+def test_rank_datasets_by_importance():
+    handler = DataRatioAblationHandler()
+    baseline_score = 1.0
+    loo_scores = {"ds1": 0.7, "ds2": 0.95, "ds3": 1.05}
+    rankings = handler.rank_datasets_by_importance(baseline_score, loo_scores)
+    # ds1: delta=0.30 → important
+    # ds2: delta=0.05 → important (boundary)
+    # ds3: delta=-0.05 → neutral (boundary)
+    assert rankings[0][0] == "ds1"
+    assert rankings[0][2] == "important"
+    assert rankings[-1][0] == "ds3"
+
+
+def test_rank_datasets_noise():
+    handler = DataRatioAblationHandler()
+    baseline_score = 1.0
+    loo_scores = {"ds1": 0.5, "ds2": 1.1}
+    rankings = handler.rank_datasets_by_importance(baseline_score, loo_scores)
+    # ds2: delta=-0.1 → noise (removing it improved score)
+    ds2 = [r for r in rankings if r[0] == "ds2"][0]
+    assert ds2[2] == "noise"
+
+
+def test_generate_saturation_configs():
+    handler = DataRatioAblationHandler()
+    configs = handler.generate_saturation_configs()
+    assert configs == [0.25, 0.50, 0.75, 1.00]

@@ -167,7 +167,7 @@ class DataRatioAblationHandler:
             delta = baseline_score - loo_score
             if delta > 0.05:
                 verdict = "important"
-            elif delta > -0.02:
+            elif delta > -0.05:
                 verdict = "neutral"
             else:
                 verdict = "noise"
