@@ -103,6 +103,7 @@ class TrainManager:
         max_steps: int,
         experiment_id: str,
         gpu_ids: list[int] | None = None,
+        resume_from_checkpoint: str | None = None,
     ) -> TrainingResult:
         """Run a single ablation experiment and return the result.
 
@@ -115,6 +116,9 @@ class TrainManager:
             subset_path=subset_path,
             max_steps=max_steps,
         )
+
+        if resume_from_checkpoint:
+            exp_config["finetuning"]["resume_from_checkpoint"] = resume_from_checkpoint
 
         output_dir = os.path.join(self.work_dir, "checkpoints", experiment_id)
         exp_config["finetuning"]["output_dir"] = output_dir
