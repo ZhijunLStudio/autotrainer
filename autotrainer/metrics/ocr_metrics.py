@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from typing import Sequence
 
 
-def _levenshtein_distance(s: str, t: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
+def _levenshtein_distance(s: Sequence, t: Sequence) -> int:
+    """Compute Levenshtein edit distance between two sequences (str or list)."""
     if len(s) < len(t):
         return _levenshtein_distance(t, s)
     if not t:
@@ -26,21 +26,35 @@ def _levenshtein_distance(s: str, t: str) -> int:
     return prev_row[-1]
 
 
+def _validate_pairs(predictions: Sequence, references: Sequence) -> int:
+    """Validate that predictions and references have the same length. Returns count."""
+    n_pred, n_ref = len(predictions), len(references)
+    if n_pred != n_ref:
+        raise ValueError(
+            f"Length mismatch: {n_pred} predictions vs {n_ref} references"
+        )
+    return n_pred
+
+
 def compute_ned(predictions: Sequence[str], references: Sequence[str]) -> float:
     """Normalized Edit Distance. Lower is better. Range [0, 1]."""
-    if not predictions:
+    n = _validate_pairs(predictions, references)
+    if n == 0:
         return 0.0
     total = 0.0
+    count = 0
     for pred, ref in zip(predictions, references):
         dist = _levenshtein_distance(pred, ref)
         max_len = max(len(pred), len(ref))
         if max_len > 0:
             total += dist / max_len
-    return total / len(predictions)
+            count += 1
+    return total / count if count > 0 else 0.0
 
 
 def compute_cer(predictions: Sequence[str], references: Sequence[str]) -> float:
     """Character Error Rate. Lower is better."""
+    _validate_pairs(predictions, references)
     total_dist = 0
     total_ref_chars = 0
     for pred, ref in zip(predictions, references):
@@ -53,6 +67,7 @@ def compute_cer(predictions: Sequence[str], references: Sequence[str]) -> float:
 
 def compute_wer(predictions: Sequence[str], references: Sequence[str]) -> float:
     """Word Error Rate. Lower is better."""
+    _validate_pairs(predictions, references)
     total_dist = 0
     total_ref_words = 0
     for pred, ref in zip(predictions, references):
@@ -67,10 +82,11 @@ def compute_wer(predictions: Sequence[str], references: Sequence[str]) -> float:
 
 def compute_exact_match(predictions: Sequence[str], references: Sequence[str]) -> float:
     """Exact Match rate. Higher is better. Range [0, 1]."""
-    if not predictions:
+    n = _validate_pairs(predictions, references)
+    if n == 0:
         return 0.0
     matches = sum(1 for p, r in zip(predictions, references) if p == r)
-    return matches / len(predictions)
+    return matches / n
 
 
 @dataclass
@@ -97,12 +113,13 @@ def compute_ocr_text_metrics(
     references: Sequence[str],
 ) -> OCRMetrics:
     """Compute all text recognition metrics at once."""
+    n = _validate_pairs(predictions, references)
     return OCRMetrics(
         ned=compute_ned(predictions, references),
         cer=compute_cer(predictions, references),
         wer=compute_wer(predictions, references),
         exact_match=compute_exact_match(predictions, references),
-        num_samples=len(predictions),
+        num_samples=n,
     )
 
 
@@ -128,6 +145,7 @@ def compute_teds_batch(
     ref_htmls: Sequence[str],
 ) -> float:
     """Average TEDS across a batch of table predictions."""
+    _validate_pairs(pred_htmls, ref_htmls)
     if not pred_htmls:
         return 0.0
     total = sum(compute_teds(p, r) for p, r in zip(pred_htmls, ref_htmls))
