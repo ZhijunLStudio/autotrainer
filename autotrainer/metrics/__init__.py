@@ -8,6 +8,10 @@ from autotrainer.metrics.ocr_metrics import (
     compute_teds_batch,
     OCRMetrics,
 )
+from autotrainer.metrics.efficiency import (
+    EfficiencyMetrics,
+    compute_efficiency_metrics,
+)
 
 __all__ = [
     "compute_ned",
@@ -18,4 +22,6 @@ __all__ = [
     "compute_teds",
     "compute_teds_batch",
     "OCRMetrics",
+    "EfficiencyMetrics",
+    "compute_efficiency_metrics",
 ]
