@@ -1,3 +1,4 @@
+from autotrainer.metrics.compute import compute_all_metrics, AllMetrics
 from autotrainer.metrics.ocr_metrics import (
     compute_ned,
     compute_cer,
@@ -14,6 +15,8 @@ from autotrainer.metrics.efficiency import (
 )
 
 __all__ = [
+    "compute_all_metrics",
+    "AllMetrics",
     "compute_ned",
     "compute_cer",
     "compute_wer",
@@ -22,6 +25,6 @@ __all__ = [
     "compute_teds",
     "compute_teds_batch",
     "OCRMetrics",
-    "EfficiencyMetrics",
     "compute_efficiency_metrics",
+    "EfficiencyMetrics",
 ]
