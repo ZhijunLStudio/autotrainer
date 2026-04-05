@@ -23,6 +23,9 @@ class LogMetrics:
     memory_mb: float | None = None
     epoch: int | None = None
     grad_norm: float | None = None
+    eval_ppl: float | None = None
+    extra_metrics: dict = field(default_factory=dict)
+    has_nan: bool = False
     raw_line: str = ""
 
 
@@ -48,6 +51,8 @@ class LogParser:
     EVAL_PATTERN = re.compile(r"eval[_\s].*?loss[:\s]+(\d+\.\d+)")
     EPOCH_PATTERN = re.compile(r"epoch[:\s]+(\d+)")
     GRAD_NORM_PATTERN = re.compile(r"grad_norm[=:]\s*([\d.]+(?:[eE][+-]?\d+)?)")
+    EVAL_KV_PATTERN = re.compile(r"eval_(\w+)[:\s]+([\d.eE+-]+)")
+    NAN_LOSS_PATTERN = re.compile(r"loss[:\s]+(?:nan|inf)", re.IGNORECASE)
 
     # Error patterns
     OOM_PATTERNS = [
@@ -118,8 +123,27 @@ class LogParser:
             except ValueError:
                 pass
 
+        # Generic eval metric extraction
+        for eval_match in self.EVAL_KV_PATTERN.finditer(line):
+            key = eval_match.group(1)
+            try:
+                value = float(eval_match.group(2))
+            except ValueError:
+                continue
+            if key == "loss":
+                metrics.eval_loss = value
+            elif key == "ppl":
+                metrics.eval_ppl = value
+            else:
+                metrics.extra_metrics[f"eval_{key}"] = value
+
+        # NaN/inf detection in loss values
+        if self.NAN_LOSS_PATTERN.search(line):
+            metrics.has_nan = True
+
         # Return None if nothing was extracted
-        if metrics.step is None and metrics.loss is None and metrics.eval_loss is None:
+        if (metrics.step is None and metrics.loss is None
+                and metrics.eval_loss is None and not metrics.extra_metrics):
             return None
 
         return metrics
