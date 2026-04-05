@@ -45,6 +45,7 @@ class TrainingResult:
     eval_loss: float | None = None
     throughput: float | None = None
     metrics: dict = field(default_factory=dict)
+    history: dict = field(default_factory=dict)  # {steps:[], train_loss:[], eval_loss:[], learning_rate:[]}
     errors: list[dict] = field(default_factory=list)
     status: str = "completed"  # completed, failed, hung
 
@@ -59,6 +60,7 @@ class TrainingResult:
             "eval_loss": self.eval_loss,
             "throughput": self.throughput,
             "metrics": self.metrics,
+            "history": self.history,
             "errors": self.errors,
             "status": self.status,
         }
@@ -256,6 +258,12 @@ class TrainManager:
 
         log_file = open(log_path, "w")
 
+        # Per-step training history for curve plots
+        history_steps: list[int] = []
+        history_train_loss: list[float] = []
+        history_eval_loss: list[float] = []
+        history_lr: list[float] = []
+
         def _on_stdout(line: str):
             log_file.write(line + "\n")
             log_file.flush()
@@ -267,6 +275,13 @@ class TrainManager:
                 self._latest_metrics = metrics
                 if self._on_metrics:
                     self._on_metrics(metrics)
+
+                # Collect per-step history
+                if metrics.step is not None:
+                    history_steps.append(metrics.step)
+                    history_train_loss.append(metrics.loss if metrics.loss is not None else 0.0)
+                    history_eval_loss.append(metrics.eval_loss if metrics.eval_loss is not None else 0.0)
+                    history_lr.append(metrics.lr if metrics.lr is not None else 0.0)
 
             error = self.log_parser.detect_error(line)
             if error:
@@ -327,6 +342,12 @@ class TrainManager:
             eval_loss=final_metrics.get("final_eval_loss"),
             throughput=final_metrics.get("throughput"),
             metrics=final_metrics,
+            history={
+                "steps": history_steps,
+                "train_loss": history_train_loss,
+                "eval_loss": history_eval_loss,
+                "learning_rate": history_lr,
+            },
             errors=self._collected_errors,
             status=status,
         )
