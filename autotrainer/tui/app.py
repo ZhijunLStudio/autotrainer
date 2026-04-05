@@ -171,6 +171,28 @@ class AutoTrainerApp(App):
         if self.agent_panel:
             self.agent_panel.update(message)
 
+    def update_experiment_status(self, scheduler_status):
+        """Update main panel with experiment queue status."""
+        s = scheduler_status
+        lines = [
+            f"\n  [bold]Experiment Queue[/bold]  ({s.completed}/{s.total} completed, {s.failed} failed)",
+            "",
+        ]
+        for phase_name, breakdown in s.phase_breakdown.items():
+            status_str = f"{breakdown['done']}/{breakdown['total']}"
+            if breakdown.get("failed", 0) > 0:
+                status_str += f" ({breakdown['failed']} failed)"
+            lines.append(f"  [bold]{phase_name}:[/bold] {status_str}")
+
+        if s.current:
+            lines.extend([
+                "",
+                f"  [yellow]Running:[/yellow] {s.current.id}",
+            ])
+
+        if self.main_panel:
+            self.main_panel.update("\n".join(lines))
+
     def show_confirm_prompt(self, message: str, callback: Any = None):
         """Show a confirmation prompt to the user."""
         self.agent_panel.update(f"\n  [yellow bold]?[/yellow bold] {message}\n\n  Press [y]es or [n]o in the input bar.")
