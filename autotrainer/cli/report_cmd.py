@@ -40,6 +40,10 @@ def report_command(work_dir: str | None, fmt: str):
         _generate_html_report(experiments, work_dir)
         return
 
+    if fmt == "full":
+        _generate_full_report(experiments, work_dir)
+        return
+
 
 def _print_text_report(experiments: list[dict]):
     """Print a text report."""
@@ -126,6 +130,26 @@ def _generate_html_report(experiments: list[dict], work_dir: str):
     with open(html_path, "w") as f:
         f.write(html)
     click.echo(f"Report saved: {html_path}")
+
+
+def _generate_full_report(experiments: list[dict], work_dir: str) -> None:
+    """Generate the full OCR report with radar, bar, line, and heatmap charts."""
+    from autotrainer.visualization.report_generator import generate_full_report as _gen
+
+    report_dir = os.path.join(work_dir, "reports")
+    training_histories = {}
+    eval_dir = os.path.join(work_dir, "eval_results")
+    if os.path.isdir(eval_dir):
+        for fname in os.listdir(eval_dir):
+            if fname.endswith(".json"):
+                with open(os.path.join(eval_dir, fname)) as f:
+                    data = json.load(f)
+                exp_id = data.get("experiment_id", fname.replace(".json", ""))
+                if "history" in data:
+                    training_histories[exp_id] = data["history"]
+
+    report_path = _gen(experiments, report_dir, training_histories)
+    print(f"Full OCR report generated: {report_path}")
 
 
 def _build_html(experiments: list[dict]) -> str:

@@ -735,11 +735,32 @@ class PipelineOrchestrator:
 
         self._notify("REPORT", f"Report saved to {report_path}")
 
-        # Generate charts if matplotlib available
+        # Generate full OCR report
         try:
-            self._generate_charts(experiments, report_dir)
-        except ImportError:
-            pass
+            from autotrainer.visualization.report_generator import generate_full_report
+
+            all_experiments = []
+            for abl in self.state.ablation_results:
+                all_experiments.append(abl)
+            if self.state.full_training_result:
+                all_experiments.append(self.state.full_training_result)
+
+            training_histories = {}
+            eval_dir = os.path.join(self.work_dir, "eval_results")
+            if os.path.isdir(eval_dir):
+                for fname in os.listdir(eval_dir):
+                    if fname.endswith(".json"):
+                        fpath = os.path.join(eval_dir, fname)
+                        data = safe_read_json(fpath) or {}
+                        exp_id = data.get("experiment_id", fname.replace(".json", ""))
+                        if "history" in data:
+                            training_histories[exp_id] = data["history"]
+
+            report_path = generate_full_report(all_experiments, report_dir, training_histories)
+            self._notify("report", f"Full OCR report generated: {report_path}")
+        except Exception as e:
+            self._notify("report", f"Full report generation failed ({e}), falling back to basic charts")
+            self._generate_charts(all_experiments, report_dir)
 
     def _generate_charts(self, experiments: list[dict], report_dir: str):
         """Generate comparison charts."""
