@@ -22,6 +22,10 @@ class LogMetrics:
     throughput: float | None = None
     memory_mb: float | None = None
     epoch: int | None = None
+    grad_norm: float | None = None
+    eval_ppl: float | None = None
+    extra_metrics: dict = field(default_factory=dict)
+    has_nan: bool = False
     raw_line: str = ""
 
 
@@ -46,6 +50,9 @@ class LogParser:
     SPEED_PATTERN = re.compile(r"(?:throughput|speed)[:\s]+([\d.]+)\s*tokens/s")
     EVAL_PATTERN = re.compile(r"eval[_\s].*?loss[:\s]+(\d+\.\d+)")
     EPOCH_PATTERN = re.compile(r"epoch[:\s]+(\d+)")
+    GRAD_NORM_PATTERN = re.compile(r"grad_norm[=:]\s*([\d.]+(?:[eE][+-]?\d+)?)")
+    EVAL_KV_PATTERN = re.compile(r"eval_(\w+)[:\s]+([\d.eE+-]+)")
+    NAN_LOSS_PATTERN = re.compile(r"loss[:\s]+(?:nan|inf)", re.IGNORECASE)
 
     # Error patterns
     OOM_PATTERNS = [
@@ -108,8 +115,37 @@ class LogParser:
         if m:
             metrics.epoch = int(m.group(1))
 
+        # Parse grad_norm
+        grad_match = self.GRAD_NORM_PATTERN.search(line)
+        if grad_match:
+            try:
+                metrics.grad_norm = float(grad_match.group(1))
+            except ValueError:
+                pass
+
+        # Generic eval metric extraction
+        for eval_match in self.EVAL_KV_PATTERN.finditer(line):
+            key = eval_match.group(1)
+            try:
+                value = float(eval_match.group(2))
+            except ValueError:
+                continue
+            if key == "loss":
+                if metrics.eval_loss is None:
+                    metrics.eval_loss = value  # Don't overwrite if EVAL_PATTERN already set it
+            elif key == "ppl":
+                metrics.eval_ppl = value
+            else:
+                metrics.extra_metrics[f"eval_{key}"] = value
+
+        # NaN/inf detection in loss values
+        if self.NAN_LOSS_PATTERN.search(line):
+            metrics.has_nan = True
+
         # Return None if nothing was extracted
-        if metrics.step is None and metrics.loss is None and metrics.eval_loss is None:
+        if (metrics.step is None and metrics.loss is None
+                and metrics.eval_loss is None and not metrics.extra_metrics
+                and not metrics.has_nan):
             return None
 
         return metrics

@@ -209,6 +209,38 @@ class ConfigBuilder:
 
         return config
 
+    def build_multi_dataset_config(
+        self,
+        model_path: str,
+        datasets: list[tuple[str, float]],
+        eval_data_path: str = "",
+        stage: str = "VL-SFT",
+        template: str = "paddleocr_vl",
+        output_dir: str = "",
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
+        """Build a config for multi-dataset training with proportional sampling."""
+        config = self.merge_configs(_PADDLEOCR_VL_DEFAULTS, {})
+        config["model"]["model_name_or_path"] = model_path
+        config["model"]["stage"] = stage
+        config["data"]["dataset_type"] = "erniekit"
+        config["data"]["template"] = template
+
+        paths = [d[0] for d in datasets]
+        probs = [d[1] for d in datasets]
+
+        config["data"]["train_dataset_path"] = ",".join(paths)
+        config["data"]["train_dataset_prob"] = ",".join(str(p) for p in probs)
+
+        if eval_data_path:
+            config["data"]["eval_dataset_path"] = eval_data_path
+        if output_dir:
+            config["finetuning"]["output_dir"] = output_dir
+        if overrides:
+            config = self.merge_configs(config, overrides)
+
+        return config
+
     @staticmethod
     def _flatten(config: dict) -> dict:
         """Flatten nested dict (model/data/finetuning -> flat keys).

@@ -28,7 +28,9 @@ from autotrainer.orchestrator.recovery import RecoveryManager, RecoveryState
 from autotrainer.orchestrator.state_machine import Phase, PhaseManager
 from autotrainer.pf_integration.config_builder import ConfigBuilder
 from autotrainer.pf_integration.log_parser import LogMetrics
+from autotrainer.orchestrator.scheduler import ExperimentScheduler, ExperimentSpec
 from autotrainer.skills.data_intel.handler import DataIntelHandler
+from autotrainer.skills.data_ratio_ablation.handler import DataRatioAblationHandler, DatasetInfo
 from autotrainer.skills.diagnose_training.handler import DiagnoseTrainingHandler
 from autotrainer.skills.loader import SkillLoader
 from autotrainer.skills.plan_experiment.handler import PlanExperimentHandler
@@ -58,6 +60,7 @@ class PipelineState:
     data_profile: dict = field(default_factory=dict)
     ablation_results: list[dict] = field(default_factory=list)
     best_ablation_config: dict = field(default_factory=dict)
+    multi_dataset_info: list[dict] = field(default_factory=list)
     full_training_result: dict = field(default_factory=dict)
     eval_result: dict = field(default_factory=dict)
 
@@ -116,6 +119,8 @@ class PipelineOrchestrator:
         self.diagnose_skill = DiagnoseTrainingHandler()
         self.plan_skill = PlanExperimentHandler()
         self.data_intel_skill = DataIntelHandler(cache_dir=self.work_dir)
+        self.scheduler = ExperimentScheduler(work_dir=self.work_dir)
+        self.ratio_ablation_skill = DataRatioAblationHandler()
 
         # Health monitor
         self.health_monitor = HealthMonitor(
@@ -300,6 +305,27 @@ class PipelineOrchestrator:
             self.state.data_profile = profile.to_dict()
             self.context.set_data_profile(profile.to_dict())
 
+            # Create per-dataset 5% subsets for ratio ablation (multi-dataset only)
+            import json as _json
+            with open(index_path, "r") as _f:
+                _index_data = _json.load(_f)
+            completed_datasets = [d for d in _index_data.get("datasets", []) if d.get("status") == "completed"]
+            if len(completed_datasets) > 1:
+                self.state.multi_dataset_info = []
+                for ds in completed_datasets:
+                    ds_name = ds.get("dataset_name", "unknown")
+                    train_path = ds.get("split", {}).get("train", {}).get("path", "")
+                    if train_path and os.path.exists(train_path):
+                        subset_path = os.path.join(ablation_data_dir, f"subset_5pct_{ds_name}.jsonl")
+                        subset_info = self.data_mgr.create_subset(train_path, subset_path, ratio=0.05)
+                        self.state.multi_dataset_info.append({
+                            "name": ds_name,
+                            "subset_path": subset_path,
+                            "sample_count": subset_info.get("subset", 0),
+                            "total_count": subset_info.get("total", 0),
+                        })
+                self._notify("DATA_PREPARE", f"Created per-dataset subsets for {len(self.state.multi_dataset_info)} datasets")
+
         # ── Path B: explicit JSONL / directory ────────────────
         else:
             data_path = self.state.data_path
@@ -405,15 +431,7 @@ class PipelineOrchestrator:
     # ════════════════════════════════════════════════════════════
 
     def _run_phase_ablation(self):
-        """Phase 3: Intelligent iterative ablation on 5% data subset.
-
-        For each factor sequentially:
-          1. Run initial experiments (3-4 values)
-          2. Analyze loss trend
-          3. Refine search range (up to 2 more rounds)
-          4. Pick best value, bake into running config for next factor
-        Combine all best values into final ablation config.
-        """
+        """Phase 3: Ablation — hyperparams + data ratio (if multi-dataset)."""
         import copy
 
         if self.phase_mgr.is_completed(Phase.ABLATION):
@@ -443,11 +461,70 @@ class PipelineOrchestrator:
             self.state.best_ablation_config = base_config
             return
 
-        # Factor definitions
-        from autotrainer.skills.plan_experiment.handler import (
-            AblationFactorConfig,
-            ExperimentRecord,
+        # ── Step A: Hyperparameter ablation ──
+        step_a_already_done = len(self.scheduler.get_experiments_by_phase("ablation_hyperparams")) > 0
+        if not step_a_already_done:
+            self._notify("ABLATION", "=== Step A: Hyperparameter Ablation ===")
+            self._build_hyperparam_experiments(base_config, subset_path)
+
+        # Run all pending Step A experiments
+        self.scheduler.run_all(
+            train_manager=self.train_mgr,
+            gpu_ids=self.gpu_ids,
+            on_progress=self._on_ablation_progress,
         )
+
+        # Determine best hyperparams from Step A
+        best_config = self._pick_best_hyperparams(base_config)
+        self._notify("ABLATION", "Step A complete. Best hyperparams applied.")
+
+        # Cleanup Step A checkpoints
+        self.scheduler.cleanup_phase_checkpoints("ablation_hyperparams")
+
+        # ── Step B: Data ratio ablation (multi-dataset only) ──
+        multi_ds = getattr(self.state, "multi_dataset_info", [])
+        if len(multi_ds) > 1:
+            self._notify("ABLATION", "=== Step B: Data Ratio Ablation ===")
+            step_b_already_done = len(self.scheduler.get_experiments_by_phase("ablation_ratio")) > 0
+            if not step_b_already_done:
+                datasets = [
+                    DatasetInfo(
+                        name=d["name"],
+                        subset_path=d["subset_path"],
+                        sample_count=d["sample_count"],
+                    )
+                    for d in multi_ds
+                ]
+                ratio_specs = self.ratio_ablation_skill.build_experiment_specs(
+                    datasets=datasets,
+                    base_config=best_config,
+                    config_builder=self.config_builder,
+                    subset_dir=os.path.join(self.work_dir, "data"),
+                )
+                self.scheduler.add_experiments(ratio_specs)
+
+            # Run all pending Step B experiments
+            self.scheduler.run_all(
+                train_manager=self.train_mgr,
+                gpu_ids=self.gpu_ids,
+                on_progress=self._on_ablation_progress,
+            )
+
+            # Pick best ratio
+            best_ratio_config = self._pick_best_ratio(best_config)
+            self.state.best_ablation_config = best_ratio_config
+            self._notify("ABLATION", "Step B complete. Best data ratio applied.")
+
+            # Cleanup Step B checkpoints
+            self.scheduler.cleanup_phase_checkpoints("ablation_ratio")
+        else:
+            self.state.best_ablation_config = best_config
+
+        self._save_recovery_state()
+
+    def _build_hyperparam_experiments(self, base_config: dict, subset_path: str):
+        """Build hyperparameter ablation experiment specs and add to scheduler."""
+        from autotrainer.skills.plan_experiment.handler import AblationFactorConfig
 
         factors = [
             AblationFactorConfig(
@@ -467,116 +544,80 @@ class PipelineOrchestrator:
             ),
         ]
 
-        # running_config accumulates best values as we go
-        running_config = copy.deepcopy(base_config)
-        exp_counter = 0
-
-        for factor_config in factors:
-            self._notify("ABLATION", f"=== Tuning {factor_config.dotted_key} ===")
-
-            current_values = list(factor_config.initial_values)
-            factor_history: list[ExperimentRecord] = []
-            best_value_for_factor = None
-
-            for round_num in range(factor_config.max_rounds):
-                if not current_values:
-                    break
-
-                round_values = current_values[:6]  # safety cap
-                self._notify(
-                    "ABLATION",
-                    f"  Round {round_num + 1}: testing {factor_config.dotted_key} in {round_values}",
+        specs = []
+        for factor in factors:
+            for value in factor.initial_values:
+                exp_id = f"abl-hyper-{factor.dotted_key.split('.')[-1]}={value}"
+                exp_config = self.config_builder.build_ablation_config(
+                    base=base_config,
+                    factor_changes={factor.dotted_key: value},
+                    subset_path=subset_path,
+                    max_steps=1000,
                 )
+                specs.append(ExperimentSpec(
+                    id=exp_id,
+                    phase="ablation_hyperparams",
+                    config=exp_config,
+                    config_diff={factor.dotted_key: value},
+                ))
 
-                for value in round_values:
-                    # Skip if we already tested this exact value
-                    already_tested = any(
-                        abs(r.value - value) < 1e-12 and r.status == "completed"
-                        for r in factor_history
-                    )
-                    if already_tested:
-                        continue
+        self.scheduler.add_experiments(specs)
 
-                    exp_counter += 1
-                    factor_name = factor_config.dotted_key.split(".")[-1]
-                    exp_id = f"abl-{exp_counter:03d}-{factor_name}={value}"
+    def _pick_best_hyperparams(self, base_config: dict) -> dict:
+        """Pick best hyperparams from completed Step A experiments."""
+        import copy
+        best_config = copy.deepcopy(base_config)
+        experiments = self.scheduler.get_experiments_by_phase("ablation_hyperparams")
+        completed = [e for e in experiments if e.status == "completed" and e.result]
 
-                    try:
-                        result = self.train_mgr.run_single_ablation(
-                            base_config=running_config,
-                            factor_changes={factor_config.dotted_key: value},
-                            subset_path=subset_path,
-                            max_steps=1000,
-                            experiment_id=exp_id,
-                            gpu_ids=self.gpu_ids,
-                        )
-                    except Exception as e:
-                        self._notify("ABLATION", f"  Experiment {exp_id} crashed: {e}")
-                        record = ExperimentRecord(
-                            id=exp_id, factor=factor_config.dotted_key,
-                            value=value, config_diff={factor_config.dotted_key: value},
-                            status="failed",
-                        )
-                        factor_history.append(record)
-                        self.state.ablation_results.append({
-                            "experiment_id": exp_id, "status": "failed",
-                        })
-                        continue
+        if not completed:
+            return best_config
 
-                    record = ExperimentRecord(
-                        id=exp_id, factor=factor_config.dotted_key,
-                        value=value, config_diff={factor_config.dotted_key: value},
-                        status=result.status,
-                        final_loss=result.final_loss,
-                        eval_loss=result.eval_loss,
-                        log_path=result.log_path,
-                    )
-                    factor_history.append(record)
-                    self.state.ablation_results.append(result.to_dict())
-                    self._notify(
-                        "ABLATION",
-                        f"    {exp_id}: loss={result.final_loss} status={result.status}",
-                    )
+        factor_best: dict[str, tuple] = {}
+        for exp in completed:
+            factor_key = list(exp.config_diff.keys())[0] if exp.config_diff else ""
+            if not factor_key:
+                continue
+            loss = exp.result.get("eval_loss") or exp.result.get("final_loss") or float("inf")
+            value = exp.config_diff[factor_key]
+            if factor_key not in factor_best or loss < factor_best[factor_key][1]:
+                factor_best[factor_key] = (value, loss)
 
-                # Analyze after each round
-                analysis = self.plan_skill.analyze_and_suggest(
-                    factor_config=factor_config,
-                    history=factor_history,
-                    round_number=round_num,
-                )
+        for factor_key, (value, _) in factor_best.items():
+            parts = factor_key.split(".")
+            target = best_config
+            for p in parts[:-1]:
+                target = target.setdefault(p, {})
+            target[parts[-1]] = value
 
-                self._notify("ABLATION", f"  → Analysis: {analysis.analysis}")
+        return best_config
 
-                if analysis.action == "done":
-                    best_value_for_factor = analysis.best_value
-                    break
+    def _pick_best_ratio(self, hyperparams_config: dict) -> dict:
+        """Pick best ratio from completed Step B experiments."""
+        import copy
+        best_config = copy.deepcopy(hyperparams_config)
+        experiments = self.scheduler.get_experiments_by_phase("ablation_ratio")
+        completed = [e for e in experiments if e.status == "completed" and e.result]
 
-                current_values = analysis.next_values
-                best_value_for_factor = analysis.best_value
+        if not completed:
+            return best_config
 
-            # Apply best value to running_config
-            if best_value_for_factor is not None:
-                parts = factor_config.dotted_key.split(".")
-                target = running_config
-                for p in parts[:-1]:
-                    target = target.setdefault(p, {})
-                target[parts[-1]] = best_value_for_factor
-                self._notify(
-                    "ABLATION",
-                    f"  ✓ Best {factor_config.dotted_key} = {best_value_for_factor}",
-                )
+        best_exp = min(
+            completed,
+            key=lambda e: e.result.get("eval_loss") or e.result.get("final_loss") or float("inf"),
+        )
 
-        # Final best config
-        self.state.best_ablation_config = running_config
-        self._save_recovery_state()
+        best_config["data"]["train_dataset_path"] = best_exp.config.get("data", {}).get("train_dataset_path", "")
+        best_config["data"]["train_dataset_prob"] = best_exp.config.get("data", {}).get("train_dataset_prob", "1.0")
 
-        # Log summary
-        lr = running_config.get("finetuning", {}).get("learning_rate", "?")
-        bs = running_config.get("finetuning", {}).get("per_device_train_batch_size", "?")
-        rank = running_config.get("model", {}).get("lora_rank", "?")
-        self._notify(
-            "ABLATION",
-            f"Ablation complete. Best config: lr={lr}, batch_size={bs}, lora_rank={rank}",
+        self._notify("ABLATION", f"Best ratio: {best_exp.config_diff.get('ratios', {})}")
+        return best_config
+
+    def _on_ablation_progress(self, status, result):
+        """Callback for ablation progress — forwards to TUI."""
+        self._notify("ABLATION",
+            f"[{status.completed}/{status.total}] {result.experiment_id}: "
+            f"loss={result.final_loss or '?'} status={result.status}"
         )
 
     # ════════════════════════════════════════════════════════════
@@ -633,6 +674,9 @@ class PipelineOrchestrator:
 
         finally:
             self.health_monitor.stop()
+            # Cleanup ablation checkpoints now that we're moving to full training
+            self.scheduler.cleanup_phase_checkpoints("ablation_hyperparams")
+            self.scheduler.cleanup_phase_checkpoints("ablation_ratio")
 
         self._save_recovery_state()
         self._notify("FULL_TRAINING", f"Full training complete. Loss={result.final_loss}")
@@ -735,11 +779,32 @@ class PipelineOrchestrator:
 
         self._notify("REPORT", f"Report saved to {report_path}")
 
-        # Generate charts if matplotlib available
+        # Generate full OCR report
         try:
-            self._generate_charts(experiments, report_dir)
-        except ImportError:
-            pass
+            from autotrainer.visualization.report_generator import generate_full_report
+
+            all_experiments = []
+            for abl in self.state.ablation_results:
+                all_experiments.append(abl)
+            if self.state.full_training_result:
+                all_experiments.append(self.state.full_training_result)
+
+            training_histories = {}
+            eval_dir = os.path.join(self.work_dir, "eval_results")
+            if os.path.isdir(eval_dir):
+                for fname in os.listdir(eval_dir):
+                    if fname.endswith(".json"):
+                        fpath = os.path.join(eval_dir, fname)
+                        data = safe_read_json(fpath) or {}
+                        exp_id = data.get("experiment_id", fname.replace(".json", ""))
+                        if "history" in data:
+                            training_histories[exp_id] = data["history"]
+
+            report_path = generate_full_report(all_experiments, report_dir, training_histories)
+            self._notify("report", f"Full OCR report generated: {report_path}")
+        except Exception as e:
+            self._notify("report", f"Full report generation failed ({e}), falling back to basic charts")
+            self._generate_charts(all_experiments, report_dir)
 
     def _generate_charts(self, experiments: list[dict], report_dir: str):
         """Generate comparison charts."""
