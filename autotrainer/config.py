@@ -196,9 +196,12 @@ class AutoTrainerConfig:
     @staticmethod
     def detect_model_path(model_id: str) -> str:
         """Resolve model path: check local cache first, fall back to HF ID."""
-        local_path = Path(f"/data-ssd/lizhijun/models/{model_id}")
-        if (local_path / "config.json").exists():
-            return str(local_path)
+        # Allow custom model directory via environment variable
+        custom_root = os.environ.get("AUTOTRAINER_MODELS_DIR")
+        if custom_root:
+            local_path = Path(custom_root) / model_id
+            if (local_path / "config.json").exists():
+                return str(local_path)
 
         hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
         for suffix in (model_id, model_id.replace("/", "--")):
