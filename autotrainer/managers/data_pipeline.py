@@ -100,17 +100,23 @@ class DataPipeline:
             else:
                 return 0
 
+            # Convert NaN to None for clean JSON output
+            records = df.where(df.notna(), None).to_dict(orient="records")
+
             count = 0
             with open(dst, "w", encoding="utf-8") as fout:
-                for _, row in df.iterrows():
-                    record = {}
-                    for k, v in row.items():
-                        try:
-                            v = v.item() if hasattr(v, "item") else (v.tolist() if hasattr(v, "tolist") else v)
-                        except Exception:
-                            v = str(v)
-                        record[str(k)] = v
-                    fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                for record in records:
+                    cleaned = {}
+                    for k, v in record.items():
+                        if v is None:
+                            cleaned[str(k)] = None
+                        elif hasattr(v, "item"):
+                            cleaned[str(k)] = v.item()
+                        elif hasattr(v, "tolist"):
+                            cleaned[str(k)] = v.tolist()
+                        else:
+                            cleaned[str(k)] = v
+                    fout.write(json.dumps(cleaned, ensure_ascii=False) + "\n")
                     count += 1
             return count
         except Exception:
@@ -128,9 +134,10 @@ class DataPipeline:
             "empty_content": 0, "output_lines": 0,
         }
         seen: set[str] = set()
-        cleaned: list[str] = []
 
-        with open(src, "r", errors="replace") as fin:
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        with open(src, "r", errors="replace") as fin, \
+             open(dst, "w") as fout:
             for line in fin:
                 stats["input_lines"] += 1
                 s = line.strip()
@@ -155,13 +162,10 @@ class DataPipeline:
                     stats["empty_content"] += 1
                     continue
 
-                cleaned.append(json.dumps(self._normalize(data), ensure_ascii=False) + "\n")
+                fout.write(json.dumps(self._normalize(data), ensure_ascii=False) + "\n")
                 stats["valid_lines"] += 1
 
-        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        with open(dst, "w") as fout:
-            fout.writelines(cleaned)
-        stats["output_lines"] = len(cleaned)
+        stats["output_lines"] = stats["valid_lines"]
         return stats
 
     def _is_empty(self, data: dict) -> bool:

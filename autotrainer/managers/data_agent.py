@@ -572,26 +572,27 @@ class DataAgent:
         Runs real shell/python commands so the LLM starts with actual information.
         """
         lines = []
+        sq = self._shell_quote
 
         # 1. Directory listing with sizes
-        ls_out = self._run_shell(f"ls -lhR {source_path} | head -80")
+        ls_out = self._run_shell(f"ls -lhR {sq(source_path)} | head -80")
         lines.append(f"$ ls -lhR {source_path} | head -80\n{ls_out}")
 
         # 2. File type summary
         find_out = self._run_shell(
-            f"find {source_path} -type f | sed 's|.*\\.||' | sort | uniq -c | sort -rn | head -20"
+            f"find {sq(source_path)} -type f | sed 's|.*\\.||' | sort | uniq -c | sort -rn | head -20"
         )
         lines.append(f"\nFile extensions summary:\n{find_out}")
 
         # 3. Sample first file of each interesting type
         for ext in ("parquet", "jsonl", "json", "csv", "tsv", "xml"):
             find_file = self._run_shell(
-                f"find {source_path} -name '*.{ext}' -type f | head -1"
+                f"find {sq(source_path)} -name '*.{ext}' -type f | head -1"
             ).strip()
             if find_file and find_file != "(no output)":
                 if ext == "parquet":
                     sample = self._run_python_snippet(
-                        f"import pandas as pd\ndf = pd.read_parquet('{find_file}')\n"
+                        f"import pandas as pd\ndf = pd.read_parquet({repr(find_file)})\n"
                         f"print('Shape:', df.shape)\nprint('Columns:', list(df.columns))\n"
                         f"print('Dtypes:\\n', df.dtypes)\nprint('\\nFirst 2 rows:')\n"
                         f"print(df.head(2).to_string(max_colwidth=80))",
@@ -599,13 +600,13 @@ class DataAgent:
                     )
                     lines.append(f"\nParquet sample ({find_file}):\n{sample}")
                 elif ext in ("jsonl", "json"):
-                    head = self._run_shell(f"head -3 {find_file}")
+                    head = self._run_shell(f"head -3 {sq(find_file)}")
                     lines.append(f"\n{ext.upper()} sample ({find_file}):\n{head}")
                 elif ext in ("csv", "tsv"):
-                    head = self._run_shell(f"head -5 {find_file}")
+                    head = self._run_shell(f"head -5 {sq(find_file)}")
                     lines.append(f"\n{ext.upper()} sample ({find_file}):\n{head}")
                 elif ext == "xml":
-                    head = self._run_shell(f"head -30 {find_file}")
+                    head = self._run_shell(f"head -30 {sq(find_file)}")
                     lines.append(f"\nXML sample ({find_file}):\n{head}")
 
         summary = "\n".join(lines)
@@ -613,6 +614,12 @@ class DataAgent:
         if len(summary) > 8000:
             summary = summary[:8000] + "\n...[pre-explore truncated]"
         return summary
+
+    @staticmethod
+    def _shell_quote(path: str) -> str:
+        """Quote a path for safe shell interpolation."""
+        import shlex
+        return shlex.quote(path)
 
     def _run_shell(self, cmd: str) -> str:
         """Run a shell command safely and return output."""
@@ -678,71 +685,9 @@ class DataAgent:
 
     def _calc_timeout(self, source_path: str) -> int:
         """Calculate sandbox timeout based on dataset size."""
-        try:
-            if os.path.isfile(source_path):
-                size_gb = os.path.getsize(source_path) / (1024 ** 3)
-            else:
-                size_gb = sum(
-                    f.stat().st_size for f in Path(source_path).rglob("*") if f.is_file()
-                ) / (1024 ** 3)
-        except OSError:
-            size_gb = 1.0
-
+        size_gb = self._calc_size_gb(source_path) or 1.0
         timeout = int(TIMEOUT_BASE + size_gb * TIMEOUT_PER_GB)
         return min(timeout, TIMEOUT_MAX)
-
-    def _inject_row_limit(self, script: str, max_rows: int) -> str:
-        """Inject a MAX_ROWS limit into a conversion script for quick validation.
-
-        Adds MAX_ROWS env var support: the script will stop after max_rows output rows.
-        This wraps the script so the original script doesn't need to be modified.
-        """
-        wrapper = f'''import os as _os, subprocess as _sp, sys as _sys, tempfile as _tmp, json as _json
-
-_MAX_ROWS = int(_os.environ.get("MAX_ROWS", "0"))
-
-# Run the original script, then cap the output
-import io as _io
-_orig_input = _os.environ.get("INPUT_PATH", "")
-_orig_output = _os.environ.get("OUTPUT_PATH", "")
-
-# Write original script to temp file
-import textwrap as _tw
-_script = _tw.dedent("""{script.replace(chr(34)*3, chr(34)*2 + chr(92) + chr(34))}""")
-with _tmp.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as _f:
-    _f.write(_script)
-    _tmp_path = _f.name
-
-# Run with a temp output
-_tmp_out = _orig_output + ".tmp_validate"
-_env = dict(_os.environ)
-_env["OUTPUT_PATH"] = _tmp_out
-import subprocess
-_r = subprocess.run(["python", _tmp_path], env=_env, capture_output=True, text=True, timeout={max_rows * 10})
-print(_r.stdout)
-if _r.returncode != 0:
-    print(_r.stderr, file=_sys.stderr)
-    _sys.exit(_r.returncode)
-
-# Cap to MAX_ROWS
-if _MAX_ROWS > 0 and _os.path.exists(_tmp_out):
-    count = 0
-    with open(_tmp_out) as _fin, open(_orig_output, "w") as _fout:
-        for _line in _fin:
-            if count >= _MAX_ROWS:
-                break
-            _fout.write(_line)
-            count += 1
-    _os.unlink(_tmp_out)
-    print(f"[validate] Capped to {{count}} rows")
-else:
-    if _os.path.exists(_tmp_out):
-        import shutil; shutil.move(_tmp_out, _orig_output)
-_os.unlink(_tmp_path)
-'''
-        # This approach is too complex — instead inject directly into the script
-        # Simply prefix the script with a row counter interceptor
-        return script  # Return original; we use separate env var approach in sandbox
 
     def _run_with_retry(
         self,
@@ -1048,8 +993,7 @@ print(f"Converted: {count} samples")
                     if not line:
                         continue
                     try:
-                        import json as _json
-                        data = _json.loads(line)
+                        data = json.loads(line)
                     except Exception:
                         continue
                     rows_checked += 1
@@ -1150,13 +1094,12 @@ print(f"Converted: {count} samples")
     def _jsonl_has_image_data(self, jsonl_path: str) -> bool:
         """Check first few rows of a JSONL for image-related fields."""
         try:
-            import json as _json
             with open(jsonl_path, "r", errors="replace") as f:
                 for i, line in enumerate(f):
                     if i >= 5:
                         break
                     try:
-                        data = _json.loads(line.strip())
+                        data = json.loads(line.strip())
                         if any(k in data for k in ("image", "img", "image_bytes", "image_url")):
                             return True
                     except Exception:
@@ -1193,9 +1136,8 @@ print(f"Converted: {count} samples")
             os.makedirs(dir_name, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
             try:
-                import json as _json
                 with os.fdopen(fd, "w") as f:
-                    _json.dump(index, f, indent=2, ensure_ascii=False)
+                    json.dump(index, f, indent=2, ensure_ascii=False)
                     f.write("\n")
                 os.replace(tmp_path, index_path)
             except Exception:

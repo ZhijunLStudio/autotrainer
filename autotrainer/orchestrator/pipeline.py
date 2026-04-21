@@ -276,6 +276,9 @@ class PipelineOrchestrator:
         )
         index_path = os.path.join(effective_data_dir, "data_index.json") if effective_data_dir else ""
 
+        ablation_data_dir = os.path.join(self.work_dir, "data")
+        ensure_dir(ablation_data_dir)
+
         if index_path and os.path.exists(index_path):
             self._notify("DATA_PREPARE", f"Reading DataAgent output from {effective_data_dir} ...")
             try:
@@ -306,9 +309,9 @@ class PipelineOrchestrator:
             self.context.set_data_profile(profile.to_dict())
 
             # Create per-dataset 5% subsets for ratio ablation (multi-dataset only)
-            import json as _json
+            import json
             with open(index_path, "r") as _f:
-                _index_data = _json.load(_f)
+                _index_data = json.load(_f)
             completed_datasets = [d for d in _index_data.get("datasets", []) if d.get("status") == "completed"]
             if len(completed_datasets) > 1:
                 self.state.multi_dataset_info = []
@@ -361,8 +364,6 @@ class PipelineOrchestrator:
                 )
 
         # ── Ablation subset (5%) ──────────────────────────────
-        ablation_data_dir = os.path.join(self.work_dir, "data")
-        ensure_dir(ablation_data_dir)
         ablation_subset_path = os.path.join(ablation_data_dir, "subset_5pct.jsonl")
         subset_info = self.data_mgr.create_subset(self.state.data_path, ablation_subset_path, ratio=0.05)
         self.state.ablation_config = {"subset_path": ablation_subset_path, "subset_info": subset_info}
@@ -432,7 +433,6 @@ class PipelineOrchestrator:
 
     def _run_phase_ablation(self):
         """Phase 3: Ablation — hyperparams + data ratio (if multi-dataset)."""
-        import copy
 
         if self.phase_mgr.is_completed(Phase.ABLATION):
             self._notify("ABLATION", "Skipped (already completed)")
