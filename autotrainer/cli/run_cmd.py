@@ -1,4 +1,4 @@
-"""Run command — starts the automated training pipeline."""
+"""Run command — starts the automated training pipeline (V2 architecture)."""
 
 from __future__ import annotations
 
@@ -38,54 +38,50 @@ def run_command(
     if not no_tui:
         try:
             from autotrainer.tui.app import run_tui
-
             run_tui(task=task, gpu_ids=gpu_ids, work_dir=cfg.work_dir, resume=resume)
             return
         except ImportError:
             click.echo("TUI not available, falling back to headless mode.")
 
-    # Headless mode
-    _run_headless(task=task, gpu_ids=gpu_ids, cfg=cfg, resume=resume, config_override=config_override)
+    # Headless mode — uses V2 pipeline
+    _run_headless(task=task, gpu_ids=gpu_ids, cfg=cfg, resume=resume)
 
 
-def _run_headless(task: str, gpu_ids: list[int], cfg, resume: bool, config_override: str | None = None):
-    """Run the pipeline without TUI using the PipelineOrchestrator."""
-    from autotrainer.orchestrator.pipeline import PipelineOrchestrator
+def _run_headless(task: str, gpu_ids: list[int], cfg, resume: bool):
+    """Run the pipeline without TUI using PipelineOrchestratorV2."""
+    from autotrainer.orchestrator.pipeline_v2 import PipelineOrchestratorV2
 
-    # Initialize orchestrator
-    orch = PipelineOrchestrator(
+    # Initialize V2 orchestrator
+    orch = PipelineOrchestratorV2(
         config=cfg,
         task=task,
         gpu_ids=gpu_ids,
         resume=resume,
     )
 
-    # Wire up click output as callbacks
-    orch.on_phase_change = lambda phase, msg: click.echo(f"\n[{phase}] {msg}")
+    # Wire up click output as context callbacks
+    orch.ctx.on_phase_change = lambda phase, msg: click.echo(f"\n[{phase}] {msg}")
 
-    def _on_confirm(message: str, context: dict) -> bool:
+    def _on_confirm(message: str, context: dict | None = None) -> bool:
         click.echo(f"\n  ? {message}")
-        return click.confirm("  Confirm?", default=True)
+        return click.confirm("  Continue?", default=True)
 
     def _on_input(prompt: str, choices: list[str]) -> str:
         click.echo(f"\n  {prompt}")
         for i, c in enumerate(choices, 1):
             click.echo(f"  [{i}] {c}")
-        return choices[0]  # Default first choice in headless
+        return choices[0] if choices else ""
 
-    orch.on_user_confirm = _on_confirm
-    orch.on_user_input = _on_input
+    orch.ctx.on_user_confirm = _on_confirm
+    orch.ctx.on_user_input = _on_input
 
-    # Phase 0: Confirm task
-    goal = click.prompt("  Training goal (e.g., 'accuracy > 0.85 on DocVQA')", default="", show_default=False)
-    data_path = click.prompt("  Data path", default="", show_default=False)
-
-    orch.confirm_task(goal=goal, data_path=data_path)
-
-    # Run remaining phases
     try:
+        click.echo(f"\nStarting pipeline: {task}")
+        click.echo(f"Run ID: {orch.run_id}")
+        click.echo(f"Work dir: {orch.work_dir}")
         orch.run()
-        click.echo("\nPipeline completed successfully!")
+        click.echo(f"\nPipeline completed successfully!")
+        click.echo(f"Run ID: {orch.run_id}")
     except Exception as e:
         click.echo(f"\nPipeline failed: {e}", err=True)
         raise SystemExit(1)

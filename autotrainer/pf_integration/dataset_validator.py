@@ -47,19 +47,19 @@ class DatasetValidator:
                 lines.append(line.strip())
 
         if not lines:
-            return ValidationResult(valid=False, errors=["File is empty"])
+            return ValidationResult(valid=False, errors=["File is empty"], warnings=[])
 
         # Detect format
         fmt = self._detect_format(lines)
         if not fmt:
-            return ValidationResult(valid=False, errors=["Cannot detect data format"])
+            return ValidationResult(valid=False, errors=["Cannot detect data format"], warnings=[])
 
         if fmt == "erniekit":
             return self._validate_erniekit(path)
         elif fmt == "messages":
             return self._validate_messages(path)
         else:
-            return ValidationResult(valid=False, errors=[f"Unknown format: {fmt}"])
+            return ValidationResult(valid=False, errors=[f"Unknown format: {fmt}"], warnings=[])
 
     def _detect_format(self, lines: list[str]) -> str | None:
         """Detect data format from sample lines."""

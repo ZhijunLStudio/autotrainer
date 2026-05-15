@@ -1,0 +1,34 @@
+name: paddleocr-vl
+description: >
+  PaddleOCR-VL — vision-language model for OCR tasks.
+  Supports detection and recognition via the PaddleFormers framework.
+
+hyperparam_space:
+  finetuning.learning_rate:
+    type: log
+    min: 1e-6
+    max: 1e-3
+    initial: [1e-5, 3e-5, 1e-4, 3e-4]
+  finetuning.per_device_train_batch_size:
+    type: linear
+    min: 1
+    max: 16
+    initial: [1, 2, 4]
+    discrete: true
+  model.lora_rank:
+    type: linear
+    min: 2
+    max: 64
+    initial: [4, 8, 16]
+    discrete: true
+
+supported_data_formats:
+  - erniekit-jsonl
+  - jsonl
+  - parquet
+  - csv
+  - directory
+
+launch_command: paddleformers/dist_train.py
+launch_env:
+  PADDLEFORMERS_HOME: "${PADDLEFORMERS_ROOT}"
