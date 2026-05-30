@@ -198,6 +198,12 @@ class AutoTrainerConfig:
         """Resolve model path: check local cache first, fall back to HF ID."""
         # Allow custom model directory via environment variable
         custom_root = os.environ.get("AUTOTRAINER_MODELS_DIR")
+        if not custom_root:
+            # Common model root directories
+            for root in ["/data-ssd/lizhijun/models", "/data/models", "/models"]:
+                if Path(root).is_dir():
+                    custom_root = root
+                    break
         if custom_root:
             local_path = Path(custom_root) / model_id
             if (local_path / "config.json").exists():

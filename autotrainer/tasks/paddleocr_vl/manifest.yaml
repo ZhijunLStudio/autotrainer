@@ -10,7 +10,7 @@ template: "paddleocr_vl"
 attn_implementation: "flashmask"
 freeze_config: "freeze_vision freeze_aligner"
 max_seq_len: 8192
-dataset_type: "erniekit"
+dataset_type: "messages"
 
 model_defaults:
   use_lora: false

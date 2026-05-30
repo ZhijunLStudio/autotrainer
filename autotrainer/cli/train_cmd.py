@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 import click
@@ -37,6 +38,20 @@ def train_command(
     if not gpu_ids:
         gpu_ids = list(range(cfg.detect_gpu_count()))
 
+    # Auto-detect: if data_dir has train.jsonl but no data_index.json, set data_path
+    if data_dir and not data_path and os.path.isdir(data_dir):
+        index_path = os.path.join(data_dir, "data_index.json")
+        if not os.path.exists(index_path):
+            # Look for train/val JSONL files directly
+            train_jsonl = os.path.join(data_dir, "train.jsonl")
+            if os.path.exists(train_jsonl):
+                data_path = train_jsonl
+                click.echo(f"Auto-detected train.jsonl in data-dir: {train_jsonl}")
+            # Also find val.jsonl
+            val_jsonl = os.path.join(data_dir, "val.jsonl")
+            if os.path.exists(val_jsonl):
+                cfg._eval_data_path = val_jsonl
+
     click.echo(f"Task: {task}")
     click.echo(f"GPUs: {gpu_ids}")
     click.echo(f"Data dir: {data_dir or '(none)'}")
@@ -60,6 +75,7 @@ def train_command(
         resume=resume,
         data_dir=data_dir,
         data_path=data_path,
+        eval_data_path=getattr(cfg, '_eval_data_path', ''),
         skip_ablation=skip_ablation,
         goal=goal,
     )
@@ -72,6 +88,7 @@ def _run_headless(
     resume: bool,
     data_dir: str,
     data_path: str,
+    eval_data_path: str,
     skip_ablation: bool,
     goal: str,
 ):
@@ -92,7 +109,6 @@ def _run_headless(
 
     def _on_confirm(message: str, context: dict | None = None) -> bool:
         click.echo(f"\n  ? {message}")
-        # Auto-confirm in non-TTY (piped) mode
         if not sys.stdin.isatty():
             click.echo("  Auto-confirming (non-TTY)...")
             return True
@@ -110,6 +126,8 @@ def _run_headless(
     orch.ctx.data_dir = data_dir
     if data_path:
         orch.ctx.data_path = data_path
+    if eval_data_path:
+        orch.ctx.eval_data_path = eval_data_path
 
     try:
         click.echo(f"Starting training: {task}")

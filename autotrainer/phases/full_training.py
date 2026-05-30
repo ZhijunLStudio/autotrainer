@@ -95,6 +95,9 @@ class FullTrainingHandler(PhaseHandler):
                     task_spec=task_spec,
                     train_data_path=ctx.data_path,
                     eval_data_path=ctx.eval_data_path,
+                    overrides={"model": {"model_name_or_path": model_path},
+                               "finetuning": {"learning_rate": 1e-5, "warmup_ratio": 0.01,
+                                              "weight_decay": 0.1, "sharding": "stage2"}},
                 )
             else:
                 return PhaseResult(Phase.FULL_TRAINING, PhaseStatus.FAILED, f"Unknown task: {ctx.task}")

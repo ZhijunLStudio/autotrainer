@@ -65,6 +65,8 @@ class HealthMonitor:
         self._lock = threading.Lock()
 
         # State tracking for anomaly detection
+        self._start_time: float = 0.0
+        self._startup_grace: float = 30.0  # 30s grace period before anomaly detection
         self._last_log_mtime: float | None = None
         self._low_util_counter: int = 0
         self._process_check_fn: Callable[[], bool] | None = None
@@ -102,6 +104,7 @@ class HealthMonitor:
         """Start the background monitoring thread."""
         if self._running:
             return
+        self._start_time = time.time()
         self._running = True
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name="health-monitor")
         self._thread.start()
@@ -220,6 +223,10 @@ class HealthMonitor:
 
     def _detect_anomaly(self, status: HealthStatus) -> str | None:
         """Detect anomalies from health status."""
+        # Startup grace: skip anomaly detection during warm-up
+        if time.time() - self._start_time < self._startup_grace:
+            return None
+
         # Process dead
         if not status.process_alive:
             self._anomaly_counters.clear()
