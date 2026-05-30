@@ -4,15 +4,18 @@ Enhanced with Claude Code-inspired retry logic:
 - Exponential backoff with jitter
 - Status-code-specific handling (429 → Retry-After, 529 → overloaded backoff, 401 → fail fast)
 - Prompt-too-long auto-truncation
+- Sync wrapper for non-async callers with retry
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import Any
 
-from openai import AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError
+from openai import OpenAI, AsyncOpenAI, APIStatusError, APIConnectionError, APITimeoutError
 
 from autotrainer.utils.retry import (
     RetryableError,
@@ -138,6 +141,81 @@ class LLMClient:
             return response.choices[0].message.content or ""
 
         return await self._api_call(_call)
+
+    # ── Sync wrappers (for non-async code with built-in retry) ──────────
+
+    def _sync_api_call(self, fn, *args, **kwargs) -> Any:
+        """Call an API function synchronously with retry."""
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                return fn(*args, **kwargs)
+            except APIStatusError as e:
+                last_exc = e
+                category = classify_status_code(e.status_code)
+                if category in ("auth", "client"):
+                    raise
+                retry_after = None
+                if hasattr(e, "response") and e.response is not None:
+                    ra = e.response.headers.get("Retry-After")
+                    if ra:
+                        try:
+                            retry_after = float(ra)
+                        except ValueError:
+                            pass
+                if retry_after and retry_after > 0:
+                    delay = min(retry_after, 60.0)
+                else:
+                    delay = min(1.0 * (2 ** (attempt - 1)), 60.0)
+                logger.warning("LLM API retry %d/%d after %.1fs: %s", attempt, 3, delay, e)
+                time.sleep(delay)
+            except (APIConnectionError, APITimeoutError) as e:
+                last_exc = e
+                delay = min(1.0 * (2 ** (attempt - 1)), 60.0)
+                logger.warning("LLM connection retry %d/%d after %.1fs: %s", attempt, 3, delay, e)
+                time.sleep(delay)
+        raise last_exc  # type: ignore
+
+    @property
+    def sync_client(self) -> OpenAI:
+        return OpenAI(base_url=self.base_url, api_key=self.api_key)
+
+    def complete_sync(self, system: str, user: str, max_tokens: int = 4096, temperature: float = 0.0) -> str:
+        """Sync version of complete() with built-in retry."""
+        def _call():
+            response = self.sync_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content or ""
+        return self._sync_api_call(_call)
+
+    def complete_json_sync(self, system: str, user: str, max_tokens: int = 4096) -> dict[str, Any]:
+        """Sync version of complete_json() with built-in retry."""
+        system_with_json = system + "\n\nYou MUST respond with valid JSON only. No markdown, no explanation."
+        raw = self.complete_sync(system_with_json, user, max_tokens, temperature=0.0)
+        text = raw.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+        return json.loads(text)
+
+    def complete_messages_sync(self, messages: list[dict], max_tokens: int = 4096, temperature: float = 0.0) -> str:
+        """Sync version of complete_messages() with built-in retry."""
+        def _call():
+            response = self.sync_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content or ""
+        return self._sync_api_call(_call)
 
     def count_tokens_estimate(self, text: str) -> int:
         """Count tokens using tiktoken (cl100k_base). Falls back to char/4 estimate."""

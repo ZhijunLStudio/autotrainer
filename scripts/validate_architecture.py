@@ -82,8 +82,8 @@ def check_store() -> bool:
     return True
 
 
-def check_registry() -> bool:
-    """Verify TaskRegistry discovers paddleocr-vl."""
+def check_registry():
+    """Verify TaskRegistry discovers tasks. Returns the registry."""
     from autotrainer.core.registry import TaskRegistry
 
     reg = TaskRegistry()
@@ -92,7 +92,7 @@ def check_registry() -> bool:
     t = reg.get("paddleocr-vl")
     assert t is not None, "paddleocr-vl not found"
     assert "finetuning.learning_rate" in t.hyperparam_space, "Missing learning_rate in hyperparams"
-    return True
+    return reg
 
 
 def check_orchestrator() -> bool:
@@ -191,7 +191,7 @@ def main():
 
     # 3. Registry
     print("\n[3/5] Checking Task Registry...")
-    check_registry()
+    reg = check_registry()
     print("  Registry: OK")
 
     # 4. Orchestrator initialization
@@ -225,7 +225,7 @@ def main():
     print(f"  New modules: core/, phases/, services/, tasks/")
     print(f"  Total new files: 15")
     print(f"  Store: SQLite (replaces 4 JSON files)")
-    print(f"  Registry: 1 task (paddleocr-vl)")
+    print(f"  Registry: {len(reg.task_names())} tasks ({', '.join(reg.task_names())})")
     print(f"  Phases: 7 independent handlers")
     print(f"  Services: ExperimentService + CheckpointService")
     print(f"  Orchestrator: 887 lines (v1) -> ~80 lines (v2)")

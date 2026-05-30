@@ -18,6 +18,7 @@ from typing import Any, Callable
 from autotrainer.config import AutoTrainerConfig
 from autotrainer.context.store import ContextStore
 from autotrainer.context.summarizer import LogSummarizer
+from autotrainer.core.registry import TaskRegistry
 from autotrainer.managers.data_manager import DataManager
 from autotrainer.managers.data_pipeline import DataPipeline
 from autotrainer.managers.env_manager import EnvManager
@@ -445,15 +446,27 @@ class PipelineOrchestrator:
 
         self.phase_mgr.transition_to(Phase.ABLATION)
 
-        # Build base config
-        model_path = self.config.detect_model_path("PaddlePaddle/PaddleOCR-VL")
-        base_config = self.config_builder.build_paddleocr_vl_config(
-            model_path=model_path,
-            train_data=self.state.data_path,
-            eval_data=self.state.eval_data_path,
-            lora=True,
-            lora_rank=8,
-        )
+        # Build base config from TaskSpec
+        registry = TaskRegistry()
+        task_spec = registry.get(self.task)
+        model_id = task_spec.model_name_or_path if task_spec else "PaddlePaddle/PaddleOCR-VL"
+        model_path = self.config.detect_model_path(model_id)
+        if task_spec:
+            base_config = self.config_builder.build_task_config(
+                task_spec=task_spec,
+                train_data_path=self.state.data_path,
+                eval_data_path=self.state.eval_data_path,
+                output_dir=os.path.join(self.work_dir, "checkpoints", "ablation-base"),
+                overrides={"model": {"use_lora": True, "lora_rank": 8}},
+            )
+        else:
+            base_config = self.config_builder.build_paddleocr_vl_config(
+                model_path=model_path,
+                train_data=self.state.data_path,
+                eval_data=self.state.eval_data_path,
+                lora=True,
+                lora_rank=8,
+            )
 
         subset_path = self.state.ablation_config.get("subset_path", "")
         if not subset_path or not os.path.exists(subset_path):
@@ -635,12 +648,22 @@ class PipelineOrchestrator:
 
         config = self.state.best_ablation_config
         if not config:
-            model_path = self.config.detect_model_path("PaddlePaddle/PaddleOCR-VL")
-            config = self.config_builder.build_paddleocr_vl_config(
-                model_path=model_path,
-                train_data=self.state.data_path,
-                eval_data=self.state.eval_data_path,
-            )
+            registry = TaskRegistry()
+            task_spec = registry.get(self.task)
+            model_id = task_spec.model_name_or_path if task_spec else "PaddlePaddle/PaddleOCR-VL"
+            model_path = self.config.detect_model_path(model_id)
+            if task_spec:
+                config = self.config_builder.build_task_config(
+                    task_spec=task_spec,
+                    train_data_path=self.state.data_path,
+                    eval_data_path=self.state.eval_data_path,
+                )
+            else:
+                config = self.config_builder.build_paddleocr_vl_config(
+                    model_path=model_path,
+                    train_data=self.state.data_path,
+                    eval_data=self.state.eval_data_path,
+                )
 
         # Ensure data paths from DATA_PREPARE phase are injected
         if self.state.data_path:

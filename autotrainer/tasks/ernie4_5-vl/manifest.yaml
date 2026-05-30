@@ -1,12 +1,12 @@
-name: paddleocr-vl
+name: ernie4_5-vl
 description: >
-  PaddleOCR-VL — vision-language model for OCR tasks.
-  Supports detection and recognition via the PaddleFormers framework.
+  ERNIE 4.5 VL — vision-language model with MoE architecture.
+  Supports multimodal understanding, OCR, and document analysis.
 
-model_name_or_path: "PaddlePaddle/PaddleOCR-VL"
+model_name_or_path: "PaddlePaddle/ernie45-vl-sft"
 model_family: "VL"
 stage: "VL-SFT"
-template: "paddleocr_vl"
+template: "ernie_vl"
 attn_implementation: "flashmask"
 freeze_config: "freeze_vision freeze_aligner"
 max_seq_len: 8192
@@ -28,16 +28,7 @@ finetuning_defaults:
   warmup_ratio: 0.1
   weight_decay: 0.01
   bf16: true
-  fp16_opt_level: "O2"
-  logging_steps: 10
-  save_steps: 500
-  eval_steps: 500
-  evaluation_strategy: "steps"
-  save_strategy: "steps"
-  save_total_limit: 3
   sharding: "stage1"
-  tensor_model_parallel_size: 1
-  pipeline_model_parallel_size: 1
   recompute_granularity: "full"
   recompute_method: "uniform"
   recompute_num_layers: 1
@@ -67,7 +58,3 @@ supported_data_formats:
   - parquet
   - csv
   - directory
-
-launch_command: paddleformers/dist_train.py
-launch_env:
-  PADDLEFORMERS_HOME: "${PADDLEFORMERS_ROOT}"

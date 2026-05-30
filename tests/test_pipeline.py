@@ -79,3 +79,41 @@ class TestStoreIntegration:
             run = store2.get_run(run_id)
             assert run is not None
             assert run["task_name"] == "paddleocr-vl"
+
+
+class TestMultiTaskSupport:
+    """Integration tests for multi-model support."""
+
+    def test_orchestrator_with_llm_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AutoTrainerConfig(work_dir=tmp)
+            orch = PipelineOrchestratorV2(
+                config=config, task="qwen3", gpu_ids=[0], skip_ablation=True,
+            )
+            assert orch.run_id.startswith("qwen3-")
+            assert orch.ctx.task == "qwen3"
+            assert orch.registry.get("qwen3") is not None
+
+    def test_orchestrator_with_vl_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AutoTrainerConfig(work_dir=tmp)
+            orch = PipelineOrchestratorV2(
+                config=config, task="qwen3-vl", gpu_ids=[0], skip_ablation=True,
+            )
+            assert orch.run_id.startswith("qwen3-vl-")
+            assert orch.ctx.task == "qwen3-vl"
+            spec = orch.registry.get("qwen3-vl")
+            assert spec is not None
+            assert spec.model_family == "VL"
+
+    def test_registry_has_all_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = AutoTrainerConfig(work_dir=tmp)
+            orch = PipelineOrchestratorV2(config=config, task="paddleocr-vl", gpu_ids=[0],
+                                          skip_ablation=True)
+            names = orch.registry.task_names()
+            assert "paddleocr-vl" in names
+            assert "qwen3" in names
+            assert "deepseek-v3" in names
+            assert "ernie4_5" in names
+            assert "llama" in names

@@ -7,6 +7,12 @@ import click
 from autotrainer import __version__
 
 
+def _get_task_choices():
+    """Lazily load task names from TaskRegistry for click.Choice."""
+    from autotrainer.core.registry import TaskRegistry
+    return TaskRegistry().task_names()
+
+
 @click.group()
 @click.version_option(version=__version__, prog_name="autotrainer")
 def cli():
@@ -30,7 +36,7 @@ def init():
 
 
 @cli.command()
-@click.option("--task", type=click.Choice(["paddleocr-vl"]), required=True, help="Task to run")
+@click.option("--task", type=click.Choice(_get_task_choices()), required=True, help="Task to run")
 @click.option("--gpus", type=str, default=None, help='GPU IDs (e.g., "0,1,2,3" or "all")')
 @click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint")
 @click.option("--no-tui", is_flag=True, default=False, help="Run without TUI (headless mode)")
@@ -89,7 +95,7 @@ def status(work_dir: str | None):
               help="Directory produced by `autotrainer data` (contains data_index.json)")
 @click.option("--data-path", "data_path", type=str, default="",
               help="Existing JSONL path to use directly")
-@click.option("--task", type=click.Choice(["paddleocr-vl"]), default="paddleocr-vl", show_default=True,
+@click.option("--task", type=click.Choice(_get_task_choices()), default="paddleocr-vl", show_default=True,
               help="Task type")
 @click.option("--gpus", type=str, default=None,
               help='GPU IDs, e.g. "0,1,2,3" or "all"')

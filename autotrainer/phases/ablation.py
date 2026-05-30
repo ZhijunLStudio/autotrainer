@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 
+from autotrainer.config import AutoTrainerConfig
 from autotrainer.core.interfaces import Phase, PhaseResult, PhaseStatus, PipelineContext, PhaseHandler
 from autotrainer.core.registry import TaskRegistry
 from autotrainer.managers.train_manager import TrainManager
@@ -33,14 +34,16 @@ class AblationHandler(PhaseHandler):
         scheduler = ExperimentScheduler(work_dir=ctx.work_dir)
         ratio_handler = DataRatioAblationHandler()
 
-        # Build base config
-        model_path = self._detect_model_path("PaddlePaddle/PaddleOCR-VL")
-        base_config = config_builder.build_paddleocr_vl_config(
-            model_path=model_path,
-            train_data=ctx.data_path,
-            eval_data=ctx.eval_data_path,
-            lora=True,
-            lora_rank=8,
+        # Build base config from TaskSpec
+        model_path = AutoTrainerConfig.detect_model_path(task_spec.model_name_or_path)
+        base_config = config_builder.build_task_config(
+            task_spec=task_spec,
+            train_data_path=ctx.data_path,
+            eval_data_path=ctx.eval_data_path,
+            output_dir=os.path.join(ctx.work_dir, "checkpoints", "ablation-base"),
+            overrides={
+                "model": {"use_lora": True, "lora_rank": 8},
+            },
         )
 
         subset_path = ctx.ablation_config.get("subset_path", "")
@@ -149,18 +152,3 @@ class AblationHandler(PhaseHandler):
             best_config.setdefault("data", {})["train_dataset_prob"] = data.get("train_dataset_prob", "1.0")
         return best_config
 
-    @staticmethod
-    def _detect_model_path(model_id: str) -> str:
-        from pathlib import Path
-        import os
-        custom_root = os.environ.get("AUTOTRAINER_MODELS_DIR")
-        if custom_root:
-            local_path = Path(custom_root) / model_id
-            if (local_path / "config.json").exists():
-                return str(local_path)
-        hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-        for suffix in (model_id, model_id.replace("/", "--")):
-            candidate = hf_cache / suffix
-            if (candidate / "config.json").exists():
-                return str(candidate)
-        return model_id

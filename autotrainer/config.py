@@ -171,8 +171,8 @@ class AutoTrainerConfig:
     health_poll_interval: float = 5.0
     health_hang_timeout: float = 300.0
 
-    # Supported tasks
-    supported_tasks: list[str] = field(default_factory=lambda: ["paddleocr-vl"])
+    # Supported tasks (auto-discovered from TaskRegistry at runtime)
+    supported_tasks: list[str] = field(default_factory=list)
 
     @staticmethod
     def detect_paddleformers_root() -> str:

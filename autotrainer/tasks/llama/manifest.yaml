@@ -1,0 +1,58 @@
+name: llama
+description: >
+  Llama — Meta's open-source LLM family (Llama 3/4).
+  Supports SFT for chat, instruction following, and domain adaptation.
+  Generic template covers Llama 3, Llama 4, and compatible derivatives.
+
+model_name_or_path: "meta-llama/Meta-Llama-3-8B"
+model_family: "LLM"
+stage: "SFT"
+template: "llama3"
+attn_implementation: "flashmask"
+freeze_config: ""
+max_seq_len: 8192
+dataset_type: "erniekit"
+
+model_defaults:
+  use_lora: true
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: ".*attn.*"
+
+finetuning_defaults:
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-5
+  num_train_epochs: 3
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  bf16: true
+  sharding: "stage1"
+
+hyperparam_space:
+  finetuning.learning_rate:
+    type: log
+    min: 1e-7
+    max: 1e-3
+    initial: [1e-5, 2e-5, 5e-5, 1e-4]
+  finetuning.per_device_train_batch_size:
+    type: linear
+    min: 1
+    max: 16
+    initial: [1, 2, 4]
+    discrete: true
+  model.lora_rank:
+    type: linear
+    min: 2
+    max: 64
+    initial: [8, 16, 32]
+    discrete: true
+
+supported_data_formats:
+  - erniekit-jsonl
+  - jsonl
+  - parquet
+  - csv
+  - directory

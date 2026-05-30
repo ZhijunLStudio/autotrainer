@@ -11,13 +11,16 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from autotrainer.pf_integration.config_builder import ConfigBuilder
 from autotrainer.pf_integration.launcher import PaddleFormersLauncher
 from autotrainer.pf_integration.log_parser import LogParser, LogMetrics
 from autotrainer.utils.subprocess_mgr import SubprocessManager
 from autotrainer.utils.file_utils import atomic_write_json
+
+if TYPE_CHECKING:
+    from autotrainer.core.interfaces import TaskSpec
 
 
 @dataclass
@@ -76,13 +79,14 @@ class TrainManager:
         on_log_line: Callable[[str], None] | None = None,
         on_metrics: Callable[[LogMetrics], None] | None = None,
         on_error: Callable[[dict], None] | None = None,
+        task_spec: "TaskSpec | None" = None,
     ):
         self.pf_root = paddleformers_root
         self.work_dir = work_dir
         self.config_builder = ConfigBuilder()
         self.log_parser = LogParser()
         self.subprocess_mgr = SubprocessManager()
-        self.launcher = PaddleFormersLauncher(paddleformers_root, self.subprocess_mgr)
+        self.launcher = PaddleFormersLauncher(paddleformers_root, self.subprocess_mgr, task_spec=task_spec)
 
         # Callbacks
         self._on_log_line = on_log_line

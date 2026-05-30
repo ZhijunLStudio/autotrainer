@@ -143,6 +143,20 @@ class TaskSpec:
 
     name: str
     description: str = ""
+    # Model identity
+    model_name_or_path: str = ""
+    model_family: str = ""  # "VL" or "LLM" — drives freeze_config behavior
+    # Training stage
+    stage: str = "SFT"  # VL-SFT, SFT, DPO, PT
+    template: str = ""  # paddleocr_vl, qwen3_nothink, etc.
+    # Model configuration
+    attn_implementation: str = ""  # flashmask, eager
+    freeze_config: str = ""  # "freeze_vision freeze_aligner" for VL models
+    max_seq_len: int = 8192
+    dataset_type: str = "erniekit"
+    # Additional overrides for model/finetuning fields not in standard schema
+    model_defaults: dict = field(default_factory=dict)
+    finetuning_defaults: dict = field(default_factory=dict)
     # Hyperparameter space for ablation
     hyperparam_space: dict = field(default_factory=dict)
     # Format requirements
