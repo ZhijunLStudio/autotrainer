@@ -87,7 +87,7 @@ class AutoTrainerApp(App):
 
     def __init__(self, task: str, gpu_ids: list[int], work_dir: str, resume: bool = False, **kwargs):
         super().__init__(**kwargs)
-        self.task = task
+        self._task = task
         self.gpu_ids = gpu_ids
         self.work_dir = work_dir
         self.resume = resume
@@ -118,11 +118,11 @@ class AutoTrainerApp(App):
     def on_mount(self):
         """Initialize the app on mount."""
         self.status_bar.update(
-            f"[b]Phase:[/b] INIT  |  [b]Task:[/b] {self.task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
+            f"[b]Phase:[/b] INIT  |  [b]Task:[/b] {self._task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
         )
         self.main_panel.update(
             f"\n  [bold]AutoTrainer v0.1.0[/bold]\n"
-            f"  Task: {self.task}\n"
+            f"  Task: {self._task}\n"
             f"  GPUs: {self.gpu_ids}\n"
             f"  Work dir: {self.work_dir}\n\n"
             f"  Initializing pipeline..."
@@ -146,7 +146,7 @@ class AutoTrainerApp(App):
         cfg = AutoTrainerConfig.from_env()
         self.main_panel.update(
             f"\n  [bold]Status[/bold]\n"
-            f"  Task: {self.task}\n"
+            f"  Task: {self._task}\n"
             f"  GPUs: {self.gpu_ids}\n"
             f"  Work dir: {self.work_dir}\n"
             f"  PaddleFormers: {cfg.paddleformers_root or 'not detected'}\n"
@@ -156,7 +156,7 @@ class AutoTrainerApp(App):
     def update_phase(self, phase: str, message: str = ""):
         """Update the current phase display."""
         self.status_bar.update(
-            f"[b]Phase:[/b] {phase}  |  [b]Task:[/b] {self.task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
+            f"[b]Phase:[/b] {phase}  |  [b]Task:[/b] {self._task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
         )
         if message:
             self.main_panel.update(f"\n  [bold]{phase}[/bold]\n\n  {message}")
