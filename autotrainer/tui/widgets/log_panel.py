@@ -51,19 +51,19 @@ class LogPanel(Static):
             if len(self._key_lines) > self.MAX_VISIBLE_LINES * 2:
                 self._key_lines = self._key_lines[-self.MAX_VISIBLE_LINES:]
 
-        self._render()
+        self._refresh_display()
 
     def toggle_mode(self):
         """Switch between smart and full mode."""
         self._mode = "full" if self._mode == "smart" else "smart"
-        self._render()
+        self._refresh_display()
 
     def _is_key_line(self, line: str) -> bool:
         """Check if a line is important enough to display."""
         return any(p.lower() in line.lower() for p in _KEY_PATTERNS)
 
-    def _render(self):
-        """Render the log panel content."""
+    def _refresh_display(self):
+        """Refresh the log panel content."""
         if self._mode == "smart":
             lines = self._key_lines[-self.MAX_VISIBLE_LINES :]
         else:
