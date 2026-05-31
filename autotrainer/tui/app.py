@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, Static
 
 from autotrainer.tui.widgets.status_bar import StatusBar
@@ -59,16 +59,6 @@ Screen {
     background: $surface;
     padding: 0 1;
 }
-
-.collapsible-header {
-    background: $primary-darken-2;
-    padding: 0 1;
-    height: 1;
-}
-
-.panel-content {
-    padding: 0 1;
-}
 """
 
 
@@ -85,18 +75,28 @@ class AutoTrainerApp(App):
         Binding("ctrl+c", "quit", "Quit"),
     ]
 
-    def __init__(self, task: str, gpu_ids: list[int], work_dir: str, resume: bool = False, **kwargs):
+    def __init__(self, task: str, gpu_ids: list[int], work_dir: str,
+                 data_dir: str = "", data_path: str = "", eval_data_path: str = "",
+                 skip_ablation: bool = False, resume: bool = False, **kwargs):
         super().__init__(**kwargs)
         self._task = task
         self.gpu_ids = gpu_ids
         self.work_dir = work_dir
+        self.data_dir = data_dir
+        self.data_path = data_path
+        self.eval_data_path = eval_data_path
+        self.skip_ablation = skip_ablation
         self.resume = resume
 
-        # Components (initialized on mount)
+        # Components
         self.status_bar: StatusBar | None = None
         self.log_panel: LogPanel | None = None
         self.agent_panel: AgentPanel | None = None
         self.main_panel: Static | None = None
+
+        # Pipeline
+        self._pipeline_thread: threading.Thread | None = None
+        self._pipeline_running = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -112,11 +112,11 @@ class AutoTrainerApp(App):
         self.log_panel = LogPanel(id="log-panel")
         yield self.log_panel
 
-        yield Input(placeholder="Press Enter to confirm, or type a command...", id="input-bar")
+        yield Input(placeholder="Press Enter to start training...", id="input-bar")
         yield Footer()
 
     def on_mount(self):
-        """Initialize the app on mount."""
+        """Initialize the app, then auto-start the training pipeline."""
         self.status_bar.update(
             f"[b]Phase:[/b] INIT  |  [b]Task:[/b] {self._task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
         )
@@ -125,24 +125,109 @@ class AutoTrainerApp(App):
             f"  Task: {self._task}\n"
             f"  GPUs: {self.gpu_ids}\n"
             f"  Work dir: {self.work_dir}\n\n"
-            f"  Initializing pipeline..."
+            f"  Starting pipeline..."
         )
-        self.agent_panel.update("[dim]Agent waiting...[/dim]")
+        self.agent_panel.update("[dim]Agent ready[/dim]")
+
+        # Auto-start pipeline in background thread
+        self._start_pipeline()
+
+    def _start_pipeline(self):
+        """Start the training pipeline in a background thread."""
+        if self._pipeline_running:
+            return
+        self._pipeline_running = True
+        self._pipeline_thread = threading.Thread(
+            target=self._run_pipeline, daemon=True, name="pipeline"
+        )
+        self._pipeline_thread.start()
+
+    def _run_pipeline(self):
+        """Run the training pipeline, pushing updates to the TUI."""
+        from autotrainer.config import AutoTrainerConfig
+        from autotrainer.orchestrator.pipeline_v2 import PipelineOrchestratorV2
+
+        cfg = AutoTrainerConfig.from_env()
+
+        orch = PipelineOrchestratorV2(
+            config=cfg,
+            task=self._task,
+            gpu_ids=self.gpu_ids,
+            resume=self.resume,
+            data_dir=self.data_dir,
+            skip_ablation=self.skip_ablation,
+        )
+
+        # Wire callbacks
+        orch.ctx.on_phase_change = self._on_phase_change
+        orch.ctx.on_user_confirm = self._on_confirm
+        orch.ctx.on_user_input = self._on_input
+
+        if self.data_path:
+            orch.ctx.data_path = self.data_path
+        if self.eval_data_path:
+            orch.ctx.eval_data_path = self.eval_data_path
+
+        try:
+            orch.run()
+            self.call_from_thread(self._on_complete)
+        except Exception as e:
+            self.call_from_thread(lambda: self._on_error(str(e)))
+
+    def _on_phase_change(self, phase: str, msg: str):
+        """Called from pipeline thread when phase changes."""
+        self.call_from_thread(lambda: self.update_phase(phase, msg))
+        if self.log_panel:
+            self.call_from_thread(lambda: self.log_panel.append_line(f"[{phase}] {msg}"))
+
+    def _on_confirm(self, message: str, context: dict | None = None) -> bool:
+        """Called from pipeline thread for user confirmation. Auto-confirms."""
+        self.call_from_thread(lambda: self.show_confirm_prompt(message))
+        return True  # Auto-confirm in TUI mode
+
+    def _on_input(self, prompt: str, choices: list[str]) -> str:
+        """Called from pipeline thread for user input. Returns first choice."""
+        return choices[0] if choices else ""
+
+    def _on_complete(self):
+        """Called when pipeline completes successfully."""
+        self.main_panel.update(
+            f"\n  [bold green]Training Complete![/bold green]\n\n"
+            f"  Check {self.work_dir} for results."
+        )
+        self.status_bar.update("[b]Phase:[/b] COMPLETED")
+        self.agent_panel.update("[bold green]All phases completed![/bold green]")
+
+    def _on_error(self, error: str):
+        """Called when pipeline fails."""
+        self.main_panel.update(f"\n  [bold red]Training Failed[/bold red]\n\n  {error}")
+        self.status_bar.update("[b]Phase:[/b] FAILED")
+        self.agent_panel.update(f"[bold red]Error:[/bold red] {error}")
+
+    def on_input_submitted(self, event: Input.Submitted):
+        """Handle user input from the input bar."""
+        value = event.value.strip().lower()
+        if value in ("q", "quit", "exit"):
+            self.exit()
+        elif value in ("y", "yes"):
+            self.agent_panel.update("[dim]Confirmed.[/dim]")
+        elif value in ("n", "no"):
+            self.agent_panel.update("[dim]Declined.[/dim]")
+        elif value == "s":
+            self.action_show_status()
+        elif value:
+            self.agent_panel.update(f"[dim]Unknown command: {value}[/dim]")
 
     def action_toggle_agent_panel(self):
-        """Toggle agent panel visibility."""
         if self.agent_panel:
-            self.agent_panel.visible = not self.agent_panel.visible
+            self.agent_panel.display = not self.agent_panel.display
 
     def action_toggle_log_mode(self):
-        """Toggle between smart and full log modes."""
         if self.log_panel:
             self.log_panel.toggle_mode()
 
     def action_show_status(self):
-        """Show status info in the main panel."""
         from autotrainer.config import AutoTrainerConfig
-
         cfg = AutoTrainerConfig.from_env()
         self.main_panel.update(
             f"\n  [bold]Status[/bold]\n"
@@ -154,25 +239,21 @@ class AutoTrainerApp(App):
         )
 
     def update_phase(self, phase: str, message: str = ""):
-        """Update the current phase display."""
         self.status_bar.update(
             f"[b]Phase:[/b] {phase}  |  [b]Task:[/b] {self._task}  |  [b]GPUs:[/b] {','.join(str(g) for g in self.gpu_ids)}"
         )
-        if message:
+        if message and self.main_panel:
             self.main_panel.update(f"\n  [bold]{phase}[/bold]\n\n  {message}")
 
     def add_log_line(self, line: str):
-        """Add a log line to the log panel."""
         if self.log_panel:
             self.log_panel.append_line(line)
 
     def set_agent_message(self, message: str):
-        """Set a message in the agent panel."""
         if self.agent_panel:
             self.agent_panel.update(message)
 
     def update_experiment_status(self, scheduler_status):
-        """Update main panel with experiment queue status."""
         s = scheduler_status
         lines = [
             f"\n  [bold]Experiment Queue[/bold]  ({s.completed}/{s.total} completed, {s.failed} failed)",
@@ -183,22 +264,22 @@ class AutoTrainerApp(App):
             if breakdown.get("failed", 0) > 0:
                 status_str += f" ({breakdown['failed']} failed)"
             lines.append(f"  [bold]{phase_name}:[/bold] {status_str}")
-
         if s.current:
-            lines.extend([
-                "",
-                f"  [yellow]Running:[/yellow] {s.current.id}",
-            ])
-
+            lines.extend(["", f"  [yellow]Running:[/yellow] {s.current.id}"])
         if self.main_panel:
             self.main_panel.update("\n".join(lines))
 
     def show_confirm_prompt(self, message: str, callback: Any = None):
-        """Show a confirmation prompt to the user."""
-        self.agent_panel.update(f"\n  [yellow bold]?[/yellow bold] {message}\n\n  Press [y]es or [n]o in the input bar.")
+        self.agent_panel.update(f"\n  [yellow bold]?[/yellow bold] {message}\n\n  Type y/n in input bar.")
 
 
-def run_tui(task: str, gpu_ids: list[int], work_dir: str, resume: bool = False):
+def run_tui(task: str, gpu_ids: list[int], work_dir: str,
+            data_dir: str = "", data_path: str = "", eval_data_path: str = "",
+            skip_ablation: bool = False, resume: bool = False):
     """Launch the TUI application."""
-    app = AutoTrainerApp(task=task, gpu_ids=gpu_ids, work_dir=work_dir, resume=resume)
+    app = AutoTrainerApp(
+        task=task, gpu_ids=gpu_ids, work_dir=work_dir,
+        data_dir=data_dir, data_path=data_path, eval_data_path=eval_data_path,
+        skip_ablation=skip_ablation, resume=resume,
+    )
     app.run()

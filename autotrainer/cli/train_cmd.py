@@ -63,7 +63,12 @@ def train_command(
     if not no_tui:
         try:
             from autotrainer.tui.app import run_tui
-            run_tui(task=task, gpu_ids=gpu_ids, work_dir=cfg.work_dir, resume=resume)
+            run_tui(
+                task=task, gpu_ids=gpu_ids, work_dir=cfg.work_dir,
+                data_dir=data_dir, data_path=data_path,
+                eval_data_path=getattr(cfg, '_eval_data_path', ''),
+                skip_ablation=skip_ablation, resume=resume,
+            )
             return
         except ImportError:
             click.echo("TUI not available, falling back to headless mode.")
